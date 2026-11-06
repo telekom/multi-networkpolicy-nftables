@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	multiv1beta1 "github.com/k8snetworkplumbingwg/multi-networkpolicy/pkg/apis/k8s.cni.cncf.io/v1beta1"
 	netdefv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
@@ -16,8 +17,10 @@ import (
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/utils/ptr"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/config"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
@@ -102,20 +105,68 @@ func TestMain(m *testing.M) {
 	os.Exit(code)
 }
 
-func TestSetupWithManager(t *testing.T) {
+func TestDependencyWatchesReconcileLocalNode(t *testing.T) {
+	ns := newNamespace("", map[string]string{"marker": "old"})
+	ns.GenerateName = "dependency-watches-"
+	seedObjects(t, ns)
+	namespace, nodeName := ns.Name, ns.Name+"-node"
+	pod := newPod(namespace, "watched-pod", nodeName, nil)
+	policy := newPolicy(namespace, "watched-policy", nil, nil)
+	policy.Annotations = map[string]string{policyNetworkAnnotation: "old"}
+	nad := &netdefv1.NetworkAttachmentDefinition{ObjectMeta: metav1.ObjectMeta{
+		Namespace: namespace, Name: "watched-network", Labels: map[string]string{"marker": "old"},
+	}}
+	// remotePod runs on another node; its labels decide peer membership for
+	// the local node's policies, so its changes must reconcile the local node.
+	remotePod := newPod(namespace, "remote-peer-pod", nodeName+"-remote", map[string]string{"marker": "old"})
+	seedObjects(t, newNode(nodeName), pod, policy, nad, remotePod)
+	setPodRunning(t, pod)
+
 	mgr, err := ctrl.NewManager(testEnv.Config, ctrl.Options{
 		Scheme:                 testScheme,
 		LeaderElection:         false,
 		Metrics:                metricsserver.Options{BindAddress: "0"},
 		HealthProbeBindAddress: "0",
+		Controller:             config.Controller{SkipNameValidation: ptr.To(true)},
 	})
 	if err != nil {
 		t.Fatalf("NewManager() error = %v", err)
 	}
 
 	r := &NodeReconciler{
-		NodeName: "test-node",
+		NodeName: nodeName,
 		Client:   mgr.GetClient(),
+		PolicyDeps: &mockPolicyDeps{getPodInfoFunc: func(*corev1.Pod) (*controllers.PodInfo, error) {
+			return &controllers.PodInfo{Interfaces: []controllers.InterfaceInfo{testInterface()}}, nil
+		}},
+	}
+	applied := make(chan [4]string, 100)
+	namespaceKey := client.ObjectKeyFromObject(ns)
+	networkKey := client.ObjectKeyFromObject(nad)
+	policyKey := client.ObjectKeyFromObject(policy)
+	remotePodKey := client.ObjectKeyFromObject(remotePod)
+	r.ApplyRulesForPodFunc = func(ctx context.Context, _ controllers.PolicyDeps, _ controllers.CommonRuleConfig, policies controllers.PolicyMap, _ *corev1.Pod, _ *controllers.PodInfo, _ string) error {
+		var currentNS corev1.Namespace
+		var currentNAD netdefv1.NetworkAttachmentDefinition
+		if err := mgr.GetClient().Get(ctx, namespaceKey, &currentNS); err != nil {
+			return err
+		}
+		if err := mgr.GetClient().Get(ctx, networkKey, &currentNAD); err != nil {
+			return err
+		}
+		var currentRemotePod corev1.Pod
+		if err := mgr.GetClient().Get(ctx, remotePodKey, &currentRemotePod); err != nil {
+			return err
+		}
+		currentPolicy := policies[policyKey]
+		if currentPolicy == nil {
+			return fmt.Errorf("watched policy is not cached")
+		}
+		select {
+		case applied <- [4]string{currentNS.Labels["marker"], currentPolicy.Annotations[policyNetworkAnnotation], currentNAD.Labels["marker"], currentRemotePod.Labels["marker"]}:
+		case <-ctx.Done():
+		}
+		return nil
 	}
 
 	if err := SetupIndexes(context.Background(), mgr); err != nil {
@@ -124,6 +175,63 @@ func TestSetupWithManager(t *testing.T) {
 	if err := r.SetupWithManager(mgr); err != nil {
 		t.Fatalf("SetupWithManager() error = %v", err)
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	stopped := make(chan error, 1)
+	go func() { stopped <- mgr.Start(ctx) }()
+	t.Cleanup(func() {
+		cancel()
+		select {
+		case err := <-stopped:
+			if err != nil {
+				t.Error(err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Error("manager did not stop")
+		}
+		cleanupCtx, cleanupCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cleanupCancel()
+		for _, obj := range []client.Object{policy, nad, pod, remotePod, newNode(nodeName), ns} {
+			if err := testClient.Delete(cleanupCtx, obj); err != nil {
+				t.Error(err)
+			}
+		}
+	})
+	await := func(want [4]string) {
+		t.Helper()
+		deadline := time.NewTimer(10 * time.Second)
+		defer deadline.Stop()
+		for {
+			select {
+			case got := <-applied:
+				if got == want {
+					return
+				}
+			case <-deadline.C:
+				t.Fatalf("no reconciliation applied dependency state %v", want)
+			}
+		}
+	}
+	await([4]string{"old", "old", "old", "old"})
+	ns.Labels["marker"] = "new"
+	if err := testClient.Update(ctx, ns); err != nil {
+		t.Fatal(err)
+	}
+	await([4]string{"new", "old", "old", "old"})
+	policy.Annotations[policyNetworkAnnotation] = "new"
+	if err := testClient.Update(ctx, policy); err != nil {
+		t.Fatal(err)
+	}
+	await([4]string{"new", "new", "old", "old"})
+	nad.Labels["marker"] = "new"
+	if err := testClient.Update(ctx, nad); err != nil {
+		t.Fatal(err)
+	}
+	await([4]string{"new", "new", "new", "old"})
+	remotePod.Labels["marker"] = "new"
+	if err := testClient.Update(ctx, remotePod); err != nil {
+		t.Fatal(err)
+	}
+	await([4]string{"new", "new", "new", "new"})
 }
 
 func resolveEnvtestAssetsDir() (string, error) {
@@ -272,6 +380,78 @@ func TestReconcile_RunningPodWithNoInterfacesDoesNotRequeue(t *testing.T) {
 	}
 	if applyCalled {
 		t.Fatalf("ApplyRulesForPodFunc was called for pod with no interfaces")
+	}
+}
+
+func TestReconcile_PendingSecondaryInterfaceRequeues(t *testing.T) {
+	namespace, nodeName := testScope(t)
+	pod := newPod(namespace, "pod-pending-interface", nodeName, map[string]string{"app": "demo"})
+	pod.Annotations = map[string]string{
+		netdefv1.NetworkAttachmentAnnot: "default/secondary",
+	}
+	seedObjects(t,
+		newNamespace(namespace, nil),
+		newNode(nodeName),
+		pod,
+	)
+	setPodRunning(t, pod)
+
+	r := &NodeReconciler{
+		NodeName: nodeName,
+		Client:   testClient,
+		PolicyDeps: &mockPolicyDeps{
+			getPodInfoFunc: func(*corev1.Pod) (*controllers.PodInfo, error) {
+				return &controllers.PodInfo{Name: pod.Name, Namespace: pod.Namespace, NodeName: nodeName}, nil
+			},
+		},
+	}
+
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Name: nodeName}})
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != 2*time.Second {
+		t.Fatalf("Reconcile() RequeueAfter = %s, want 2s", result.RequeueAfter)
+	}
+}
+
+// A pod whose secondary network is reported in network-status but handled by
+// a plugin this controller does not manage never gains interfaces, so it must
+// not requeue forever.
+func TestReconcile_UnmanagedSecondaryInterfaceDoesNotRequeue(t *testing.T) {
+	namespace, nodeName := testScope(t)
+	pod := newPod(namespace, "pod-unmanaged-interface", nodeName, map[string]string{"app": "demo"})
+	pod.Annotations = map[string]string{
+		netdefv1.NetworkAttachmentAnnot: "default/secondary",
+	}
+	seedObjects(t,
+		newNamespace(namespace, nil),
+		newNode(nodeName),
+		pod,
+	)
+	setPodRunning(t, pod)
+
+	r := &NodeReconciler{
+		NodeName: nodeName,
+		Client:   testClient,
+		PolicyDeps: &mockPolicyDeps{
+			getPodInfoFunc: func(*corev1.Pod) (*controllers.PodInfo, error) {
+				return &controllers.PodInfo{
+					Name:          pod.Name,
+					Namespace:     pod.Namespace,
+					NodeName:      nodeName,
+					NetworkStatus: []netdefv1.NetworkStatus{{Name: "default/secondary", Interface: "net1"}},
+				}, nil
+			},
+		},
+	}
+
+	result, err := r.Reconcile(context.Background(), reconcile.Request{NamespacedName: types.NamespacedName{Name: nodeName}})
+	if err != nil {
+		t.Fatalf("Reconcile() error = %v", err)
+	}
+	if result.RequeueAfter != 0 {
+		t.Fatalf("Reconcile() RequeueAfter = %s, want no requeue", result.RequeueAfter)
 	}
 }
 
