@@ -54,6 +54,9 @@ type Options struct {
 	// healthBindAddress is the IP address the health HTTP server binds to.
 	// Defaults to "" (all interfaces); set to "127.0.0.1" to restrict to loopback.
 	healthBindAddress string
+	tcOffloadMode     string
+	tcCTMode          string
+	enableTCBackend   bool
 
 	// updated by command line parsing
 	allowSrcPrefix []string
@@ -69,6 +72,7 @@ type ReconcilerConfig struct {
 	ContainerRuntimeEndpoint string
 	NetworkPlugins           []string
 	SyncPeriodSeconds        int
+	EnableTCBackend          bool
 	CommonRuleConfig         controllers.CommonRuleConfig
 }
 
@@ -94,6 +98,9 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&o.allowDstPrefixText, "allow-dst-prefix", "", "Accept destination IP prefix list, comma separated CIDRs (e.g. \"fe80::/10,ff00::/8\")")
 	fs.IntVar(&o.healthPort, "health-port", 0, "TCP port for the health HTTP server (0 to disable, 1-65535 to enable).")
 	fs.StringVar(&o.healthBindAddress, "health-bind-address", "", "IP address the health HTTP server binds to (empty = all interfaces, 127.0.0.1 = loopback only).")
+	fs.StringVar(&o.tcOffloadMode, "tc-offload-mode", "hardware", "tc flower offload mode for the SR-IOV backend: 'hardware' (skip_sw, hardware-only, fail-closed; production default) or 'software' (skip_hw, in-kernel software enforcement). Ignored by the nft backend.")
+	fs.StringVar(&o.tcCTMode, "tc-ct-mode", "require", "Stateful conntrack (CT) offload policy for the SR-IOV backend. 'require' (default): enforce on the eSwitch only with hardware CT offload (SMFS steering confirmed via devlink); otherwise the VF falls back to the stateful nftables backend in the pod netns, with a warning and the multinetworkpolicy_tc_backend_fallback_total{reason=\"ct_offload_unavailable\"} metric. 'auto': transitional escape hatch that restores the previous default; uses CT where SMFS is confirmed, otherwise degrades to the STATELESS tc pipeline (established/related return traffic is not tracked). It may be removed in a future release. 'off': never use CT (always stateless tc). Ignored by the nft backend.")
+	fs.BoolVar(&o.enableTCBackend, "enable-tc-backend", true, "Enable the SR-IOV tc-flower dataplane backend for VF-representor interfaces. When false, the base-branch behavior is restored exactly: every SR-IOV interface is enforced by the nftables backend in the pod netns, and the tc backend is never probed. When true, a VF that tc cannot enforce (legacy eSwitch, no representor, not a VF, or --tc-ct-mode=require without SMFS) also falls back to nftables. Every fallback is logged once per VF and reason and counted in multinetworkpolicy_tc_backend_fallback_total{reason}. Default: true.")
 	fs.AddGoFlagSet(flag.CommandLine)
 }
 
@@ -164,11 +171,14 @@ func (o *Options) BuildReconcilerConfig() (*ReconcilerConfig, error) {
 		ContainerRuntimeEndpoint: o.containerRuntimeEndpoint,
 		NetworkPlugins:           o.networkPlugins,
 		SyncPeriodSeconds:        o.syncPeriod,
+		EnableTCBackend:          o.enableTCBackend,
 		CommonRuleConfig: controllers.CommonRuleConfig{
 			AcceptICMP:     o.acceptICMP,
 			AcceptICMPv6:   o.acceptICMPv6,
 			AllowSrcPrefix: o.allowSrcPrefix,
 			AllowDstPrefix: o.allowDstPrefix,
+			TCOffloadMode:  o.tcOffloadMode,
+			CTMode:         o.tcCTMode,
 		},
 	}, nil
 }
@@ -177,6 +187,10 @@ func (o *Options) BuildReconcilerConfig() (*ReconcilerConfig, error) {
 func NewOptions() *Options {
 	return &Options{
 		containerRuntime: controllers.Cri,
+		// The SR-IOV tc-flower backend is on by default; AddFlags also sets this
+		// default for the CLI path, but set it here too so an Options built
+		// programmatically without AddFlags still defaults to enabled.
+		enableTCBackend: true,
 	}
 }
 
