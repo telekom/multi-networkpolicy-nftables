@@ -18,10 +18,12 @@ package server
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"maps"
 	"math"
 	"net"
 	"net/netip"
@@ -80,6 +82,14 @@ type nftState struct {
 	rules  map[string]*nftables.Rule
 	sets   map[string]*nftables.Set
 	chains map[string]*nftables.Chain
+	// deletedRules holds the rules deleted in the pending batch, which the
+	// kernel still lists until the batch is flushed.
+	deletedRules map[ruleHandle]bool
+}
+
+type ruleHandle struct {
+	table  string
+	handle uint64
 }
 
 func policyRuleNamespacedName(o *multiv1beta1.MultiNetworkPolicy) string {
@@ -678,37 +688,38 @@ func ruleEqual(a, b *nftables.Rule) bool {
 	}
 
 	for i := range a.Exprs {
-		switch a.Exprs[i].(type) {
+		aExpr, bExpr := canonicalExpr(a.Exprs[i]), canonicalExpr(b.Exprs[i])
+		switch aExpr.(type) {
 		case *expr.Meta:
-			if !exprEqual(&expr.Meta{}, a.Exprs[i], b.Exprs[i]) {
+			if !exprEqual(&expr.Meta{}, aExpr, bExpr) {
 				return false
 			}
 		case *expr.Lookup:
-			if !exprEqual(&expr.Lookup{}, a.Exprs[i], b.Exprs[i]) {
+			if !exprEqual(&expr.Lookup{}, aExpr, bExpr) {
 				return false
 			}
 		case *expr.Verdict:
-			if !exprEqual(&expr.Verdict{}, a.Exprs[i], b.Exprs[i]) {
+			if !exprEqual(&expr.Verdict{}, aExpr, bExpr) {
 				return false
 			}
 		case *expr.Cmp:
-			if !exprEqual(&expr.Cmp{}, a.Exprs[i], b.Exprs[i]) {
+			if !exprEqual(&expr.Cmp{}, aExpr, bExpr) {
 				return false
 			}
 		case *expr.Payload:
-			if !exprEqual(&expr.Payload{}, a.Exprs[i], b.Exprs[i]) {
+			if !exprEqual(&expr.Payload{}, aExpr, bExpr) {
 				return false
 			}
 		case *expr.Ct:
-			if !exprEqual(&expr.Ct{}, a.Exprs[i], b.Exprs[i]) {
+			if !exprEqual(&expr.Ct{}, aExpr, bExpr) {
 				return false
 			}
 		case *expr.Bitwise:
-			if !exprEqual(&expr.Bitwise{}, a.Exprs[i], b.Exprs[i]) {
+			if !exprEqual(&expr.Bitwise{}, aExpr, bExpr) {
 				return false
 			}
 		case *expr.Counter:
-			if _, ok := b.Exprs[i].(*expr.Counter); !ok {
+			if _, ok := bExpr.(*expr.Counter); !ok {
 				return false
 			}
 		default:
@@ -749,6 +760,10 @@ func (n *nftState) updateSet(set *nftables.Set, elements []nftables.SetElement) 
 
 	exists := err == nil && existingSet != nil
 
+	if exists && existingSet.Constant {
+		return n.replaceConstantSet(existingSet, set, elements)
+	}
+
 	if exists {
 		existingElements, err := n.nft.GetSetElements(existingSet)
 		if err != nil {
@@ -759,16 +774,13 @@ func (n *nftState) updateSet(set *nftables.Set, elements []nftables.SetElement) 
 
 		if len(toAdd) > 0 || len(toDel) > 0 {
 			klog.V(8).Infof("updating set %q, table %q", existingSet.Name, existingSet.Table.Name)
-			if len(toDel) > 0 {
-				if err := n.nft.SetDeleteElements(existingSet, toDel); err != nil {
-					return fmt.Errorf("failed to remove elements from set %q: %w", existingSet.Name, err)
-				}
-			}
-
-			if len(toAdd) > 0 {
-				if err := n.nft.SetAddElements(existingSet, toAdd); err != nil {
-					return fmt.Errorf("failed to add elements to set %q: %w", existingSet.Name, err)
-				}
+			// Refill the set rather than apply the difference: the kernel
+			// rejects deleting interval elements in some orders, and an
+			// interval end whose start was deleted alone cannot be deleted
+			// later. Flush and refill is one atomic step of the batch.
+			n.nft.FlushSet(existingSet)
+			if err := n.nft.SetAddElements(existingSet, elements); err != nil {
+				return fmt.Errorf("failed to add elements to set %q: %w", existingSet.Name, err)
 			}
 		}
 
@@ -782,6 +794,49 @@ func (n *nftState) updateSet(set *nftables.Set, elements []nftables.SetElement) 
 		return fmt.Errorf("failed to add set %q to table %q: %w", set.Name, set.Table.Name, err)
 	}
 
+	n.sets[fmt.Sprintf("%s-%s", set.Table.Name, set.Name)] = set
+	return nil
+}
+
+// replaceConstantSet replaces a set that an older version created constant.
+// A constant set rejects any element change, so a policy edit would fail the
+// batch until the pod restarts. In the same batch, it deletes the rules that
+// look up the set and the set, and adds the set as wanted. The callers add
+// their lookup rule right after updateSet, and findRule skips the deleted
+// rule, so updateRule adds it again.
+func (n *nftState) replaceConstantSet(existingSet, set *nftables.Set, elements []nftables.SetElement) error {
+	klog.V(2).Infof("replacing constant set %q, table %q", existingSet.Name, existingSet.Table.Name)
+	chains, err := n.nft.ListChainsOfTableFamily(existingSet.Table.Family)
+	if err != nil {
+		return fmt.Errorf("failed to list chains to replace set %q: %w", existingSet.Name, err)
+	}
+	for _, chain := range chains {
+		if chain.Table.Name != existingSet.Table.Name {
+			continue
+		}
+		rules, err := n.nft.GetRules(existingSet.Table, chain)
+		if err != nil {
+			return fmt.Errorf("failed to list rules of chain %q to replace set %q: %w", chain.Name, existingSet.Name, err)
+		}
+		for _, rule := range rules {
+			if slices.ContainsFunc(rule.Exprs, func(e expr.Any) bool {
+				l, ok := e.(*expr.Lookup)
+				return ok && l.SetName == existingSet.Name
+			}) {
+				if err := n.nft.DelRule(rule); err != nil {
+					return fmt.Errorf("failed to delete rule of set %q: %w", existingSet.Name, err)
+				}
+				if n.deletedRules == nil {
+					n.deletedRules = map[ruleHandle]bool{}
+				}
+				n.deletedRules[ruleHandle{existingSet.Table.Name, rule.Handle}] = true
+			}
+		}
+	}
+	n.nft.DelSet(existingSet)
+	if err := n.nft.AddSet(set, elements); err != nil {
+		return fmt.Errorf("failed to add set %q to table %q: %w", set.Name, set.Table.Name, err)
+	}
 	n.sets[fmt.Sprintf("%s-%s", set.Table.Name, set.Name)] = set
 	return nil
 }
@@ -804,7 +859,9 @@ func findNonCommon(a, b []nftables.SetElement) []nftables.SetElement {
 
 func isPresent(toCheck nftables.SetElement, elements []nftables.SetElement) bool {
 	for _, e := range elements {
-		if slices.Compare(toCheck.Key, e.Key) == 0 {
+		// In an interval set, an interval end can have the same key as the
+		// start of the next interval; they are different elements.
+		if toCheck.IntervalEnd == e.IntervalEnd && slices.Compare(toCheck.Key, e.Key) == 0 {
 			return true
 		}
 	}
@@ -913,34 +970,47 @@ func (n *nftState) allowNeighborDiscovery(chain *nftables.Chain) error {
 }
 
 func getPrefixesAsSetInterval(prefixes []string) ([]nftables.SetElement, []nftables.SetElement, error) {
-	v4Prefixes := []nftables.SetElement{}
-	v6Prefixes := []nftables.SetElement{}
+	// An interval set rejects overlapping elements, which fails the whole
+	// batch, so merge overlapping, duplicate and adjacent prefixes first.
+	var builder netipx.IPSetBuilder
 	for index, addr := range prefixes {
-		net, err := netip.ParsePrefix(addr) // validate
+		prefix, err := netip.ParsePrefix(addr) // validate
 		if err != nil {
 			return nil, nil, fmt.Errorf("failed to parse CIDR %q prefix[%d]: %w", addr, index, err)
 		}
-		if net.Addr().Is4() {
-			// specific first element to inform nftables this is an interval set
-			if index == 0 {
-				v4Prefixes = append(v4Prefixes, nftables.SetElement{
-					Key:         netip.IPv4Unspecified().AsSlice(),
-					IntervalEnd: true,
-				})
-			}
-			v4Prefixes = append(v4Prefixes, convertPrefixToSet(net)...)
-		} else {
-			// specific first element to inform nftables this is an interval set
-			if index == 0 {
-				v6Prefixes = append(v6Prefixes, nftables.SetElement{
-					Key:         netip.IPv6Unspecified().AsSlice(),
-					IntervalEnd: true,
-				})
-			}
-			v6Prefixes = append(v6Prefixes, convertPrefixToSet(net)...)
+		builder.AddPrefix(prefix)
+	}
+	ipSet, err := builder.IPSet()
+	if err != nil {
+		return nil, nil, fmt.Errorf("failed to merge prefixes %v: %w", prefixes, err)
+	}
+	v4Prefixes := []nftables.SetElement{}
+	v6Prefixes := []nftables.SetElement{}
+	for _, r := range ipSet.Ranges() {
+		elements := &v4Prefixes
+		if r.From().Is6() {
+			elements = &v6Prefixes
 		}
+		// specific first element to inform nftables this is an interval set
+		if len(*elements) == 0 {
+			*elements = append(*elements, nftables.SetElement{Key: unspecifiedAddr(r.From()).AsSlice(), IntervalEnd: true})
+		}
+		// nftables needs half-open intervals [first, last+1); past the
+		// last address, the end wraps to the all-0s address.
+		end := r.To().Next()
+		if !end.IsValid() {
+			end = unspecifiedAddr(r.From())
+		}
+		*elements = append(*elements, nftables.SetElement{Key: r.From().AsSlice()}, nftables.SetElement{Key: end.AsSlice(), IntervalEnd: true})
 	}
 	return v4Prefixes, v6Prefixes, nil
+}
+
+func unspecifiedAddr(addr netip.Addr) netip.Addr {
+	if addr.Is4() {
+		return netip.IPv4Unspecified()
+	}
+	return netip.IPv6Unspecified()
 }
 
 func (n *nftState) applyCommonPrefixRules(chain *nftables.Chain, prefixes []string, prefix string) error {
@@ -1120,27 +1190,6 @@ func (n *nftState) applyCommonChainRules(cfg controllers.CommonRuleConfig) error
 	}
 
 	return nil
-}
-
-func convertPrefixToSet(prefix netip.Prefix) []nftables.SetElement {
-	// nftables needs half-open intervals [firstIP, lastIP) for prefixes
-	// e.g. 10.0.0.0/24 becomes [10.0.0.0, 10.0.1.0), 10.1.1.1/32 becomes [10.1.1.1, 10.1.1.2) etc
-	firstIP := prefix.Masked().Addr()
-	lastIP := netipx.PrefixLastIP(prefix).Next()
-	elements := []nftables.SetElement{
-		{Key: firstIP.AsSlice()},
-	}
-	// It seems .Next does not return a valid IP for the all-0s address
-	// So we need to special case that here
-	if (lastIP == netip.Addr{}) {
-		// we had a turnover, so add the all-0s address as the interval end
-		if firstIP.Is4() {
-			return append(elements, nftables.SetElement{Key: netip.IPv4Unspecified().AsSlice(), IntervalEnd: true})
-		}
-		return append(elements, nftables.SetElement{Key: netip.IPv6Unspecified().AsSlice(), IntervalEnd: true})
-	}
-
-	return append(elements, nftables.SetElement{Key: lastIP.AsSlice(), IntervalEnd: true})
 }
 
 func ifname(n string) []byte {
@@ -1392,7 +1441,6 @@ func (n *nftState) applyPrefixes(chainName string, chain *nftables.Chain, policy
 		prefixesSet := &nftables.Set{
 			Table:    chain.Table,
 			Name:     fmt.Sprintf("%s_%s_%s_%s_%d", chainName, peerIPBlockPrefix, protocol, getAddressSuffix(chainName), peerIndex),
-			Constant: true,
 			Counter:  true,
 			KeyType:  keyType,
 			Interval: true,
@@ -1491,8 +1539,30 @@ func (n *nftState) applyPolicyPeersRulesIPBlock(chainName string, chain *nftable
 	return nil
 }
 
-func (n *nftState) applyPolicyPeersRulesSelector(ctx context.Context, deps controllers.PolicyDeps, chainName string, chain *nftables.Chain, policyName string, peer multiv1beta1.MultiNetworkPolicyPeer,
+func (n *nftState) applyPolicyPeersRulesSelector(ctx context.Context, deps controllers.PolicyDeps, chainName string, chain *nftables.Chain, policyName, policyNamespace string, peer multiv1beta1.MultiNetworkPolicyPeer,
 	podInfo *controllers.PodInfo, policyNetworks []string, peerIndex int) error {
+	peerPods, err := selectorPeerPods(ctx, deps, peer, policyNamespace, podInfo, policyNetworks)
+	if err != nil {
+		return err
+	}
+
+	podIntfIPs := make([]string, 0, len(peerPods))
+	for ip := range peerPods {
+		podIntfIPs = append(podIntfIPs, ip)
+	}
+
+	if err := n.addIPRules(chainName, podIntfIPs, chain, policyName, peer, peerIndex); err != nil {
+		return fmt.Errorf("add selector IP rules: %w", err)
+	}
+
+	return nil
+}
+
+// selectorPeerPods returns the pods that a selector peer matches, by their IPs
+// on the policy networks. A peer without a namespaceSelector matches pods in
+// policyNamespace only. IPs of the selected pod itself are left out.
+func selectorPeerPods(ctx context.Context, deps controllers.PolicyDeps, peer multiv1beta1.MultiNetworkPolicyPeer, policyNamespace string,
+	podInfo *controllers.PodInfo, policyNetworks []string) (map[string]*controllers.PodInfo, error) {
 	if peer.PodSelector != nil {
 		klog.V(8).Infof("applying peers rules with pod selector: %s", peer.PodSelector.String())
 	} else {
@@ -1503,7 +1573,7 @@ func (n *nftState) applyPolicyPeersRulesSelector(ctx context.Context, deps contr
 		var err error
 		podSelector, err = metav1.LabelSelectorAsSelector(peer.PodSelector)
 		if err != nil {
-			return fmt.Errorf("pod selector: %w", err)
+			return nil, fmt.Errorf("pod selector: %w", err)
 		}
 	} else {
 		podSelector = labels.Everything()
@@ -1511,7 +1581,7 @@ func (n *nftState) applyPolicyPeersRulesSelector(ctx context.Context, deps contr
 
 	pods, err := deps.ListPods(ctx, podSelector)
 	if err != nil {
-		return fmt.Errorf("pod list failed: %w", err)
+		return nil, fmt.Errorf("pod list failed: %w", err)
 	}
 
 	var nsSelector labels.Selector
@@ -1520,7 +1590,7 @@ func (n *nftState) applyPolicyPeersRulesSelector(ctx context.Context, deps contr
 		var err error
 		nsSelector, err = metav1.LabelSelectorAsSelector(peer.NamespaceSelector)
 		if err != nil {
-			return fmt.Errorf("namespace selector: %w", err)
+			return nil, fmt.Errorf("namespace selector: %w", err)
 		}
 	}
 	// Build set of protected IPs from the protected pod
@@ -1535,8 +1605,13 @@ func (n *nftState) applyPolicyPeersRulesSelector(ctx context.Context, deps contr
 	}
 
 	// Collect peer IPs, excluding protected IPs
-	globalPeerIPs := make(map[string]struct{})
+	peerPods := make(map[string]*controllers.PodInfo)
 	for _, sPod := range pods {
+		// Like NetworkPolicy: a peer without a namespaceSelector selects pods
+		// in the policy's own namespace only.
+		if nsSelector == nil && sPod.Namespace != policyNamespace {
+			continue
+		}
 		nsLabels, err := deps.GetNamespaceInfo(ctx, sPod.Namespace)
 		if err != nil {
 			klog.Errorf("cannot get namespace info: %v %v", sPod.Name, err)
@@ -1557,22 +1632,13 @@ func (n *nftState) applyPolicyPeersRulesSelector(ctx context.Context, deps contr
 			}
 			for _, ip := range sPodIntf.IPs {
 				if _, isProtected := protectedIPs[ip]; !isProtected {
-					globalPeerIPs[ip] = struct{}{}
+					peerPods[ip] = sPodinfo
 				}
 			}
 		}
 	}
 
-	var podIntfIPs []string
-	for ip := range globalPeerIPs {
-		podIntfIPs = append(podIntfIPs, ip)
-	}
-
-	if err := n.addIPRules(chainName, podIntfIPs, chain, policyName, peer, peerIndex); err != nil {
-		return fmt.Errorf("add selector IP rules: %w", err)
-	}
-
-	return nil
+	return peerPods, nil
 }
 
 func (n *nftState) addIPRule(chainName string, addrs []string, chain *nftables.Chain, policyName string, peer multiv1beta1.MultiNetworkPolicyPeer,
@@ -1699,7 +1765,7 @@ func (n *nftState) addIPRules(chainName string, addrs []string, chain *nftables.
 	return nil
 }
 
-func (n *nftState) applyPolicyPeersRules(ctx context.Context, deps controllers.PolicyDeps, chainName string, chain *nftables.Chain, policyName string, peers []multiv1beta1.MultiNetworkPolicyPeer,
+func (n *nftState) applyPolicyPeersRules(ctx context.Context, deps controllers.PolicyDeps, chainName string, chain *nftables.Chain, policyName, policyNamespace string, peers []multiv1beta1.MultiNetworkPolicyPeer,
 	podInfo *controllers.PodInfo, policyNetworks []string, peerIndex int) error {
 	peersName := nftNameWithSuffix(chainName, "-", fmt.Sprintf("%s-%d", peersChainSuffix, peerIndex))
 
@@ -1732,7 +1798,7 @@ func (n *nftState) applyPolicyPeersRules(ctx context.Context, deps controllers.P
 			continue
 		}
 		if peer.PodSelector != nil || peer.NamespaceSelector != nil {
-			if err := n.applyPolicyPeersRulesSelector(ctx, deps, peersName, peersChain, policyName, peer, podInfo, policyNetworks, index); err != nil {
+			if err := n.applyPolicyPeersRulesSelector(ctx, deps, peersName, peersChain, policyName, policyNamespace, peer, podInfo, policyNetworks, index); err != nil {
 				return fmt.Errorf("apply selector peer rules at index %d: %w", index, err)
 			}
 			continue
@@ -1772,6 +1838,9 @@ func (n *nftState) findRule(rule *nftables.Rule) (*nftables.Rule, error) {
 	}
 
 	for _, r := range rules {
+		if n.deletedRules[ruleHandle{r.Table.Name, r.Handle}] {
+			continue
+		}
 		if ruleEqual(rule, r) {
 			return r, nil
 		}
@@ -1786,7 +1855,6 @@ func (n *nftState) getInetSet(chain *nftables.Chain, portsName, suffix string) *
 		Table:    chain.Table,
 		Name:     setName,
 		Comment:  setName,
-		Constant: true,
 		Counter:  true,
 		KeyType:  nftables.TypeInetService,
 		Interval: true,
@@ -1884,7 +1952,83 @@ func validatePortSpec(port multiv1beta1.MultiNetworkPolicyPort) ([]nftables.SetE
 	return elements, nil
 }
 
-func (n *nftState) applyPolicyPortsRules(chainName string, chain *nftables.Chain, policyName string, ports []multiv1beta1.MultiNetworkPolicyPort, portIndex int) error {
+// validatePolicy returns the error that building the policy's rules hits
+// whatever the cluster state: an unsupported port, an invalid CIDR, an invalid
+// selector or an empty peer.
+func validatePolicy(policy *multiv1beta1.MultiNetworkPolicy) error {
+	var ports []multiv1beta1.MultiNetworkPolicyPort
+	var peers []multiv1beta1.MultiNetworkPolicyPeer
+	for _, r := range policy.Spec.Ingress {
+		ports = append(ports, r.Ports...)
+		peers = append(peers, r.From...)
+	}
+	for _, r := range policy.Spec.Egress {
+		ports = append(ports, r.Ports...)
+		peers = append(peers, r.To...)
+	}
+	for _, port := range ports {
+		// Named ports resolve against container ports when the rules are
+		// built; one that matches nothing allows nothing but is valid.
+		if namedPortName(port) != "" {
+			continue
+		}
+		if _, err := validatePortSpec(port); err != nil {
+			return err
+		}
+	}
+	for index, peer := range peers {
+		switch {
+		case peer.IPBlock != nil:
+			if _, _, err := getPrefixesAsSetInterval(append([]string{peer.IPBlock.CIDR}, peer.IPBlock.Except...)); err != nil {
+				return err
+			}
+		case peer.PodSelector != nil || peer.NamespaceSelector != nil:
+			for _, sel := range []*metav1.LabelSelector{peer.PodSelector, peer.NamespaceSelector} {
+				if _, err := metav1.LabelSelectorAsSelector(sel); err != nil {
+					return fmt.Errorf("peer %d: %w", index, err)
+				}
+			}
+		default:
+			return fmt.Errorf("unknown peer rule at index %d: %+v", index, peer)
+		}
+	}
+	return nil
+}
+
+// mergePortIntervals merges overlapping and adjacent port intervals. An
+// interval set rejects overlapping elements, which fails the whole batch, yet
+// a policy may list overlapping ports, such as 80-90 and 85-95. elements holds
+// [start, end) pairs as validatePortSpec returns them; an end of 0 is 65536.
+func mergePortIntervals(elements []nftables.SetElement) []nftables.SetElement {
+	type interval struct{ start, end uint32 }
+	intervals := make([]interval, 0, len(elements)/2)
+	for i := 0; i+1 < len(elements); i += 2 {
+		end := uint32(binaryutil.BigEndian.Uint16(elements[i+1].Key))
+		if end == 0 {
+			end = math.MaxUint16 + 1
+		}
+		intervals = append(intervals, interval{start: uint32(binaryutil.BigEndian.Uint16(elements[i].Key)), end: end})
+	}
+	slices.SortFunc(intervals, func(a, b interval) int { return cmp.Compare(a.start, b.start) })
+	merged := make([]interval, 0, len(intervals))
+	for _, iv := range intervals {
+		if last := len(merged) - 1; last >= 0 && iv.start <= merged[last].end {
+			merged[last].end = max(merged[last].end, iv.end)
+			continue
+		}
+		merged = append(merged, iv)
+	}
+	out := make([]nftables.SetElement, 0, 2*len(merged))
+	for _, iv := range merged {
+		out = append(out,
+			nftables.SetElement{Key: binaryutil.BigEndian.PutUint16(uint16(iv.start))},                  //nolint:gosec // G115: start is a port in [1, 65535]
+			nftables.SetElement{Key: binaryutil.BigEndian.PutUint16(uint16(iv.end)), IntervalEnd: true}, //nolint:gosec // G115: 65536 wraps to the 0 past-max sentinel
+		)
+	}
+	return out
+}
+
+func (n *nftState) applyPolicyPortsRules(chainName string, chain *nftables.Chain, policyName string, ports []multiv1beta1.MultiNetworkPolicyPort, portIndex int, targets namedPortTargets) error {
 	portsName := nftNameWithSuffix(chainName, "-", fmt.Sprintf("%s-%d", portsChainSuffix, portIndex))
 	// create ports chain
 	portChain, err := n.addChain(&nftables.Chain{
@@ -1913,8 +2057,11 @@ func (n *nftState) applyPolicyPortsRules(chainName string, chain *nftables.Chain
 	portsTCP := []nftables.SetElement{}
 	portsUDP := []nftables.SetElement{}
 	portsSCTP := []nftables.SetElement{}
-	for _, port := range ports {
-		if port.Port == nil && port.Protocol != nil {
+	numericPorts, tuples, hasNamedPorts := resolveRuleNamedPorts(policyName, chainName, ports, targets)
+	for _, port := range numericPorts {
+		// A port entry without a port matches all ports of its protocol,
+		// which defaults to TCP.
+		if port.Port == nil {
 			port.Port = &intstr.IntOrString{Type: intstr.Int, IntVal: 1}
 			port.EndPort = new(int32)
 			*port.EndPort = math.MaxUint16
@@ -1939,6 +2086,7 @@ func (n *nftState) applyPolicyPortsRules(chainName string, chain *nftables.Chain
 		}
 
 	}
+	portsTCP, portsUDP, portsSCTP = mergePortIntervals(portsTCP), mergePortIntervals(portsUDP), mergePortIntervals(portsSCTP)
 	if len(portsTCP) > 0 {
 		suffix, unixFlag := getProtocolInfo(v1.ProtocolTCP)
 		tcpSet := n.getInetSet(chain, portsName, suffix)
@@ -1970,7 +2118,15 @@ func (n *nftState) applyPolicyPortsRules(chainName string, chain *nftables.Chain
 		}
 	}
 
-	if len(ports) == 0 || (len(portsTCP) == 0 && len(portsUDP) == 0 && len(portsSCTP) == 0) {
+	for _, key := range slices.SortedFunc(maps.Keys(tuples), compareNamedPortTupleKeys) {
+		if err := n.applyNamedPortTupleRule(portsName, portChain, policyName, key, slices.Collect(maps.Values(tuples[key]))); err != nil {
+			return err
+		}
+	}
+
+	// A named port that resolves to nothing must allow nothing, so named
+	// ports never fall back to accepting all ports.
+	if len(ports) == 0 || (!hasNamedPorts && len(portsTCP) == 0 && len(portsUDP) == 0 && len(portsSCTP) == 0) {
 		// if no ports are specified, accept all ports
 		if _, err := n.updateRule(&nftables.Rule{
 			Table:    chain.Table,
@@ -2025,10 +2181,10 @@ func (n *nftState) applyPodRules(ctx context.Context, deps controllers.PolicyDep
 			if err := n.applyMarkReset(policyChainName, policyChain, policyNamespacedName(policy), index); err != nil {
 				return newRules, fmt.Errorf("failed to apply ingress mark reset for policy %q: %w", policyNamespacedName(policy), err)
 			}
-			if err := n.applyPolicyPortsRules(policyChainName, policyChain, policyNamespacedName(policy), ingress.Ports, index); err != nil {
+			if err := n.applyPolicyPortsRules(policyChainName, policyChain, policyNamespacedName(policy), ingress.Ports, index, namedPortTargets{local: podInfo.ContainerPorts}); err != nil {
 				return newRules, fmt.Errorf("failed to apply ingress ports for policy %q: %w", policyNamespacedName(policy), err)
 			}
-			if err := n.applyPolicyPeersRules(ctx, deps, policyChainName, policyChain, policyNamespacedName(policy), ingress.From, podInfo, policyNetworks, index); err != nil {
+			if err := n.applyPolicyPeersRules(ctx, deps, policyChainName, policyChain, policyNamespacedName(policy), policy.Namespace, ingress.From, podInfo, policyNetworks, index); err != nil {
 				return newRules, fmt.Errorf("failed to apply ingress address rules for policy %q: %w", policyNamespacedName(policy), err)
 			}
 			if err := n.applyMarkCheck(policyChainName, policyChain, policyNamespacedName(policy), index); err != nil {
@@ -2040,10 +2196,14 @@ func (n *nftState) applyPodRules(ctx context.Context, deps controllers.PolicyDep
 			if err := n.applyMarkReset(policyChainName, policyChain, policy.Name, index); err != nil {
 				return newRules, fmt.Errorf("failed to apply egress mark reset for policy %q: %w", policyNamespacedName(policy), err)
 			}
-			if err := n.applyPolicyPortsRules(policyChainName, policyChain, policyNamespacedName(policy), egress.Ports, index); err != nil {
+			peerPods, err := egressNamedPortPeers(ctx, deps, egress, policy.Namespace, podInfo, policyNetworks)
+			if err != nil {
+				return newRules, fmt.Errorf("failed to resolve egress named ports for policy %q: %w", policyNamespacedName(policy), err)
+			}
+			if err := n.applyPolicyPortsRules(policyChainName, policyChain, policyNamespacedName(policy), egress.Ports, index, namedPortTargets{peers: peerPods}); err != nil {
 				return newRules, fmt.Errorf("failed to apply egress ports for policy %q: %w", policyNamespacedName(policy), err)
 			}
-			if err := n.applyPolicyPeersRules(ctx, deps, policyChainName, policyChain, policyNamespacedName(policy), egress.To, podInfo, policyNetworks, index); err != nil {
+			if err := n.applyPolicyPeersRules(ctx, deps, policyChainName, policyChain, policyNamespacedName(policy), policy.Namespace, egress.To, podInfo, policyNetworks, index); err != nil {
 				return newRules, fmt.Errorf("failed to apply egress address rules for policy %q: %w", policyNamespacedName(policy), err)
 			}
 			if err := n.applyMarkCheck(policyChainName, policyChain, policyNamespacedName(policy), index); err != nil {
@@ -2085,6 +2245,7 @@ func chainID(c *nftables.Chain) string {
 func (n *nftState) cleanup() error {
 	defer func() {
 		n.rules = make(map[string]*nftables.Rule)
+		n.deletedRules = nil
 		n.sets = make(map[string]*nftables.Set)
 		n.chains = make(map[string]*nftables.Chain)
 	}()

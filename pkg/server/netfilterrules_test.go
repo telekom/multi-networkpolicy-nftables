@@ -22,6 +22,7 @@ import (
 	"math"
 	"net"
 	"net/netip"
+	"slices"
 	"strings"
 	"testing"
 
@@ -266,7 +267,7 @@ func TestApplyPolicyRulesForPodAndFamilyReturnsPolicyRuleError(t *testing.T) {
 	if err == nil {
 		t.Fatal("ApplyPolicyRulesForPodAndFamily() error = nil, want invalid policy rule error")
 	}
-	if !strings.Contains(err.Error(), "failed to apply pod ingress rules") || !strings.Contains(err.Error(), "out of range") {
+	if !strings.Contains(err.Error(), "invalid policy") || !strings.Contains(err.Error(), "out of range") {
 		t.Fatalf("ApplyPolicyRulesForPodAndFamily() error = %v, want invalid port context", err)
 	}
 }
@@ -1155,6 +1156,111 @@ func TestApplyPodRulesNamespaceSelectorOnlyPeer(t *testing.T) {
 	}
 }
 
+// TestApplyPodRulesPodSelectorOnlyPeerOwnNamespace checks the namespace scope
+// of selector peers, like Kubernetes NetworkPolicy: a peer with only a
+// podSelector selects pods in the policy's own namespace, and a peer with a
+// namespaceSelector and a podSelector selects matching pods in the selected
+// namespaces. Both pods carry the same label and sit on the policy network, so
+// only the namespace tells them apart. It covers ingress from and egress to.
+func TestApplyPodRulesPodSelectorOnlyPeerOwnNamespace(t *testing.T) {
+	c, newNS := nftest.OpenSystemConn(t, true, DEBUG)
+	defer nftest.CleanupSystemConn(t, newNS, DEBUG)
+	defer c.CloseLasting()
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	nftState, testNs, mockServer, podMockInfo, err := prepareEnv(c, true)
+	if err != nil {
+		t.Fatalf("failed to prepare test env: %s", err.Error())
+	}
+
+	policyNet := fmt.Sprintf("%s/policy-net-1", testNs)
+	podMockInfo.Interfaces = append(podMockInfo.Interfaces, controllers.InterfaceInfo{
+		NetattachName: policyNet,
+		InterfaceType: "macvlan",
+		InterfaceName: "net1",
+		IPs:           []string{"10.1.1.1"},
+	})
+	policyNetworks := []string{policyNet}
+
+	otherNs := "otherns"
+	addNamespace(mockServer, otherNs)
+	web := map[string]string{"app": "web"}
+	addPod(mockServer, NewFakePodWithNetAnnotation(testNs, "web-own", policyNet,
+		NewFakeNetworkStatus(testNs, "policy-net-1", "192.168.20.1", "10.20.0.1"), web))
+	addPod(mockServer, NewFakePodWithNetAnnotation(otherNs, "web-other", policyNet,
+		NewFakeNetworkStatus(testNs, "policy-net-1", "192.168.20.2", "10.20.0.2"), web))
+
+	podOnly := []multiv1beta1.MultiNetworkPolicyPeer{{PodSelector: &metav1.LabelSelector{MatchLabels: web}}}
+	nsAndPod := []multiv1beta1.MultiNetworkPolicyPeer{{
+		NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"nsname": otherNs}},
+		PodSelector:       &metav1.LabelSelector{MatchLabels: web},
+	}}
+	policy := &multiv1beta1.MultiNetworkPolicy{
+		ObjectMeta: metav1.ObjectMeta{Name: "web", Namespace: testNs},
+		Spec: multiv1beta1.MultiNetworkPolicySpec{
+			Ingress:     []multiv1beta1.MultiNetworkPolicyIngressRule{{From: podOnly}, {From: nsAndPod}},
+			Egress:      []multiv1beta1.MultiNetworkPolicyEgressRule{{To: podOnly}, {To: nsAndPod}},
+			PolicyTypes: []multiv1beta1.MultiPolicyType{multiv1beta1.PolicyTypeIngress, multiv1beta1.PolicyTypeEgress},
+		},
+	}
+	for _, chain := range []*nftables.Chain{nftState.ingressChain, nftState.egressChain} {
+		if _, err := nftState.applyPodRules(context.Background(), mockServer, mockServer.cfg, chain, podMockInfo, policy, policyNetworks); err != nil {
+			t.Fatalf("applyPodRules(%s) failed: %v", chain.Name, err)
+		}
+	}
+	if err := nftState.nft.Flush(); err != nil {
+		t.Fatalf("nft flush failed: %v", err)
+	}
+
+	for _, direction := range []string{ingressChain, egressChain} {
+		for index, want := range []string{"10.20.0.1", "10.20.0.2"} {
+			chainName := fmt.Sprintf("%s-%s-%s-%d", direction, policyRuleNamespacedName(policy), peersChainSuffix, index)
+			if got := peerChainIPs(t, c, nftState.filter, chainName); !slices.Equal(got, []string{want}) {
+				t.Errorf("%s peer IPs = %v, want [%s]", chainName, got, want)
+			}
+		}
+	}
+}
+
+// peerChainIPs returns the sorted addresses in the sets that the rules of a
+// peers chain look up.
+func peerChainIPs(t *testing.T, c *nftables.Conn, table *nftables.Table, chainName string) []string {
+	t.Helper()
+	actual, err := getChainByNameInComment(c, table, chainName)
+	if err != nil {
+		t.Fatalf("failed to get peer chain %q: %v", chainName, err)
+	}
+	rules, err := c.GetRules(table, &nftables.Chain{Name: actual})
+	if err != nil {
+		t.Fatalf("GetRules(%q) failed: %v", actual, err)
+	}
+	var ips []string
+	for _, r := range rules {
+		for _, e := range r.Exprs {
+			lookup, ok := e.(*expr.Lookup)
+			if !ok {
+				continue
+			}
+			set, err := c.GetSetByName(table, lookup.SetName)
+			if err != nil {
+				t.Fatalf("GetSetByName(%q) failed: %v", lookup.SetName, err)
+			}
+			elems, err := c.GetSetElements(set)
+			if err != nil {
+				t.Fatalf("GetSetElements(%q) failed: %v", lookup.SetName, err)
+			}
+			for _, elem := range elems {
+				if ip, ok := netip.AddrFromSlice(elem.Key); ok {
+					ips = append(ips, ip.String())
+				}
+			}
+		}
+	}
+	slices.Sort(ips)
+	return ips
+}
+
 // TestApplyPolicyPeersRulesIPBlockExceptPreservesORSemantics verifies that an
 // ipBlock peer with an "except" CIDR is wrapped in its own per-entry subchain,
 // so that the except rule's VerdictReturn only exits that subchain back to the
@@ -1207,7 +1313,7 @@ func TestApplyPolicyPeersRulesIPBlockExceptPreservesORSemantics(t *testing.T) {
 	chainName := nftState.ingressChain.Name
 	chain := nftState.ingressChain
 
-	if err := nftState.applyPolicyPeersRules(context.Background(), mockServer, chainName, chain, "test-policy", peers, podMockInfo, []string{"net1", "net2"}, 0); err != nil {
+	if err := nftState.applyPolicyPeersRules(context.Background(), mockServer, chainName, chain, "test-policy", "testns1", peers, podMockInfo, []string{"net1", "net2"}, 0); err != nil {
 		t.Fatalf("applyPolicyPeersRules() failed: %v", err)
 	}
 
@@ -1399,12 +1505,12 @@ func TestApplyPolicyPortsRules(t *testing.T) {
 		},
 	}
 
-	err = nftState.applyPolicyPortsRules(nftState.ingressChain.Name, nftState.ingressChain, mockPolicy.Name, []multiv1beta1.MultiNetworkPolicyPort{}, 0)
+	err = nftState.applyPolicyPortsRules(nftState.ingressChain.Name, nftState.ingressChain, mockPolicy.Name, []multiv1beta1.MultiNetworkPolicyPort{}, 0, namedPortTargets{})
 	if err != nil {
 		t.Fatalf("applyPolicyPortsRules() for ingress failed: %v", err)
 	}
 
-	err = nftState.applyPolicyPortsRules(nftState.egressChain.Name, nftState.egressChain, mockPolicy.Name, []multiv1beta1.MultiNetworkPolicyPort{}, 0)
+	err = nftState.applyPolicyPortsRules(nftState.egressChain.Name, nftState.egressChain, mockPolicy.Name, []multiv1beta1.MultiNetworkPolicyPort{}, 0, namedPortTargets{})
 	if err != nil {
 		t.Fatalf("applyPolicyPortsRules() for egress failed: %v", err)
 	}
@@ -1464,10 +1570,9 @@ func TestApplyPolicyPortsRules(t *testing.T) {
 	}
 }
 
-// TestApplyPolicyPortsRulesNamedPortRejection tests that applyPolicyPortsRules returns
-// an error for named (non-numeric) string ports and succeeds for numeric string ports.
-// This covers the Cellebyte feedback: string ports like "8080" are valid, "http" is not.
-func TestApplyPolicyPortsRulesNamedPortRejection(t *testing.T) {
+// TestApplyPolicyPortsRulesNumericStringPort tests that a numeric string port
+// such as "8080" is a numeric port, not a named one.
+func TestApplyPolicyPortsRulesNumericStringPort(t *testing.T) {
 	c, newNS := nftest.OpenSystemConn(t, true, DEBUG)
 	defer nftest.CleanupSystemConn(t, newNS, DEBUG)
 	defer c.CloseLasting()
@@ -1481,29 +1586,16 @@ func TestApplyPolicyPortsRulesNamedPortRejection(t *testing.T) {
 
 	proto := corev1.ProtocolTCP
 	port8080Str := intstr.FromString("8080")
-	portHTTPStr := intstr.FromString("http")
-
-	t.Run("numeric string port 8080 succeeds", func(t *testing.T) {
-		ports := []multiv1beta1.MultiNetworkPolicyPort{
-			{Protocol: &proto, Port: &port8080Str},
-		}
-		if err := nftState.applyPolicyPortsRules(nftState.ingressChain.Name, nftState.ingressChain, "test-policy", ports, 10); err != nil {
-			t.Fatalf("applyPolicyPortsRules() with numeric string port %q should succeed, got: %v", port8080Str.StrVal, err)
-		}
-	})
-
-	t.Run("named port http rejected with error", func(t *testing.T) {
-		ports := []multiv1beta1.MultiNetworkPolicyPort{
-			{Protocol: &proto, Port: &portHTTPStr},
-		}
-		err := nftState.applyPolicyPortsRules(nftState.ingressChain.Name, nftState.ingressChain, "test-policy", ports, 11)
-		if err == nil {
-			t.Fatal("applyPolicyPortsRules() with named port \"http\" should return an error, got nil")
-		}
-		if !strings.Contains(err.Error(), "named port") {
-			t.Fatalf("applyPolicyPortsRules() error = %q, want it to contain \"named port\"", err.Error())
-		}
-	})
+	ports := []multiv1beta1.MultiNetworkPolicyPort{{Protocol: &proto, Port: &port8080Str}}
+	if err := nftState.applyPolicyPortsRules(nftState.ingressChain.Name, nftState.ingressChain, "test-policy", ports, 10, namedPortTargets{}); err != nil {
+		t.Fatalf("applyPolicyPortsRules() with numeric string port %q should succeed, got: %v", port8080Str.StrVal, err)
+	}
+	if err := nftState.nft.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	if got := portIntervals(t, c, findSetByComment(t, c, nftState.filter, "", "_10_tcp")); !slices.Equal(got, [][2]uint16{{8080, 8080}}) {
+		t.Fatalf("tcp ports = %v, want [[8080 8080]]", got)
+	}
 }
 
 type testPort struct {
@@ -2242,5 +2334,239 @@ func TestCleanupChainsKeepsForeignTableChains(t *testing.T) {
 	}
 	if !foundForeignChain {
 		t.Errorf("foreign empty chain was incorrectly removed")
+	}
+}
+
+// TestApplyPolicyPortsRulesOverlappingPorts checks that overlapping and
+// adjacent ports of a rule are merged, since an interval set rejects
+// overlapping elements and so would fail the whole batch, and that a port
+// entry without a port allows all ports of its protocol, which defaults to TCP.
+func TestApplyPolicyPortsRulesOverlappingPorts(t *testing.T) {
+	c, newNS := nftest.OpenSystemConn(t, true, DEBUG)
+	defer nftest.CleanupSystemConn(t, newNS, DEBUG)
+	defer c.CloseLasting()
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	nftState, _, _, _, err := prepareEnv(c, false)
+	if err != nil {
+		t.Fatalf("failed to prepare test env: %s", err.Error())
+	}
+
+	udp := corev1.ProtocolUDP
+	p53, p80, p85, p96, p97 := intstr.FromInt32(53), intstr.FromInt32(80), intstr.FromInt32(85), intstr.FromInt32(96), intstr.FromInt32(97)
+	end90, end95 := int32(90), int32(95)
+	overlapping := []multiv1beta1.MultiNetworkPolicyPort{
+		{Port: &p85, EndPort: &end95},
+		{Port: &p80, EndPort: &end90},
+		{Port: &p96}, // adjacent to 85-95
+		{Port: &p97},
+		{Protocol: &udp, Port: &p53},
+		{Protocol: &udp, Port: &p53},
+	}
+	for index, ports := range [][]multiv1beta1.MultiNetworkPolicyPort{overlapping, {{}, {Port: &p80}}} {
+		if err := nftState.applyPolicyPortsRules(nftState.ingressChain.Name, nftState.ingressChain, "ns/p", ports, index, namedPortTargets{}); err != nil {
+			t.Fatalf("applyPolicyPortsRules(%d): %v", index, err)
+		}
+	}
+	if err := nftState.nft.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	for suffix, want := range map[string][][2]uint16{
+		"ports_0_tcp": {{80, 97}},
+		"ports_0_udp": {{53, 53}},
+		"ports_1_tcp": {{1, 65535}},
+	} {
+		if got := portIntervals(t, c, findSetByComment(t, c, nftState.filter, "", suffix)); !slices.Equal(got, want) {
+			t.Errorf("%s = %v, want %v", suffix, got, want)
+		}
+	}
+	for _, s := range sets(t, c, nftState.filter) {
+		if strings.Contains(s.Comment, "ports_1_udp") {
+			t.Error("a port entry without protocol and port created a UDP set")
+		}
+	}
+}
+
+func sets(t *testing.T, c *nftables.Conn, table *nftables.Table) []*nftables.Set {
+	t.Helper()
+	all, err := c.GetSets(table)
+	if err != nil {
+		t.Fatalf("GetSets(%s): %v", table.Name, err)
+	}
+	return all
+}
+
+// findSetByComment returns the one set whose comment (its unhashed name) has
+// the given prefix and suffix.
+func findSetByComment(t *testing.T, c *nftables.Conn, table *nftables.Table, prefix, suffix string) *nftables.Set {
+	t.Helper()
+	var found []*nftables.Set
+	var comments []string
+	for _, s := range sets(t, c, table) {
+		comments = append(comments, s.Comment)
+		if strings.HasPrefix(s.Comment, prefix) && strings.HasSuffix(s.Comment, suffix) {
+			found = append(found, s)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("found %d sets with comment %q...%q, want 1; sets: %v", len(found), prefix, suffix, comments)
+	}
+	return found[0]
+}
+
+// portIntervals returns the closed port intervals of an interval set.
+func portIntervals(t *testing.T, c *nftables.Conn, set *nftables.Set) [][2]uint16 {
+	t.Helper()
+	els, err := c.GetSetElements(set)
+	if err != nil {
+		t.Fatalf("GetSetElements(%s): %v", set.Name, err)
+	}
+	var starts, ends []uint16
+	for _, e := range els {
+		if e.IntervalEnd {
+			ends = append(ends, binaryutil.BigEndian.Uint16(e.Key)-1)
+		} else {
+			starts = append(starts, binaryutil.BigEndian.Uint16(e.Key))
+		}
+	}
+	slices.Sort(starts)
+	slices.Sort(ends)
+	if len(starts) != len(ends) {
+		t.Fatalf("set %s has %d starts and %d ends", set.Name, len(starts), len(ends))
+	}
+	out := make([][2]uint16, len(starts))
+	for i := range starts {
+		out[i] = [2]uint16{starts[i], ends[i]}
+	}
+	return out
+}
+
+// prefixIntervals returns the [start-end) address intervals of the named
+// interval set, leaving out the all-0s elements.
+func prefixIntervals(t *testing.T, c *nftables.Conn, table *nftables.Table, name string) []string {
+	t.Helper()
+	if len(name) > 31 {
+		var err error
+		if name, err = hash(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	els, err := c.GetSetElements(&nftables.Set{Table: table, Name: name})
+	if err != nil {
+		t.Fatalf("GetSetElements(%s): %v", name, err)
+	}
+	var starts, ends []netip.Addr
+	for _, e := range els {
+		addr, _ := netip.AddrFromSlice(e.Key)
+		switch {
+		case addr.IsUnspecified():
+		case e.IntervalEnd:
+			ends = append(ends, addr)
+		default:
+			starts = append(starts, addr)
+		}
+	}
+	slices.SortFunc(starts, netip.Addr.Compare)
+	slices.SortFunc(ends, netip.Addr.Compare)
+	if len(starts) != len(ends) {
+		t.Fatalf("set %s has starts %v and ends %v", name, starts, ends)
+	}
+	var out []string
+	for i := range starts {
+		out = append(out, starts[i].String()+"-"+ends[i].String())
+	}
+	return out
+}
+
+// exceptSetName returns the name of the except set of an IPBlock peer.
+func exceptSetName(chain *nftables.Chain, family string, peerIndex int) string {
+	chainName := fmt.Sprintf("%s-%s-%d", chain.Name, ipBlockChainSuffix, peerIndex)
+	return fmt.Sprintf("%s_%s_%s_%s_%d", chainName, peerIPBlockExceptPrefix, family, getAddressSuffix(chainName), peerIndex)
+}
+
+// TestOverlappingPrefixesBuild checks that overlapping, duplicate and adjacent
+// prefixes that share an interval set are merged: the except list of an
+// IPBlock and the common allowed prefixes. Unmerged, the kernel rejects the
+// set and the whole batch fails.
+func TestOverlappingPrefixesBuild(t *testing.T) {
+	c, newNS := nftest.OpenSystemConn(t, true, DEBUG)
+	defer nftest.CleanupSystemConn(t, newNS, DEBUG)
+	defer c.CloseLasting()
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	nftState, _, _, _, err := prepareEnv(c, false)
+	if err != nil {
+		t.Fatalf("failed to prepare test env: %s", err.Error())
+	}
+
+	for index, ipBlock := range []multiv1beta1.IPBlock{
+		{CIDR: "10.0.0.0/16", Except: []string{"10.0.1.0/24", "10.0.1.0/25", "10.0.1.0/24", "10.0.2.0/24"}},
+		{CIDR: "fd00::/48", Except: []string{"fd00::/64", "fd00::/80", "fd00:0:0:1::/64"}},
+	} {
+		peer := multiv1beta1.MultiNetworkPolicyPeer{IPBlock: &ipBlock}
+		if err := nftState.applyPolicyPeersRulesIPBlock(nftState.ingressChain.Name, nftState.ingressChain, "ns/p", peer, index); err != nil {
+			t.Fatalf("applyPolicyPeersRulesIPBlock(%d): %v", index, err)
+		}
+	}
+	if err := nftState.applyCommonPrefixRules(nftState.commonIngressChain, []string{"192.168.0.0/16", "192.168.1.0/24", "fd01::/48", "fd01::/48"}, "overlap"); err != nil {
+		t.Fatalf("applyCommonPrefixRules(): %v", err)
+	}
+	if err := nftState.nft.Flush(); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+
+	commonSuffix := getAddressSuffix(nftState.commonIngressChain.Name)
+	for name, want := range map[string][]string{
+		exceptSetName(nftState.ingressChain, protoIPv4, 0):    {"10.0.1.0-10.0.3.0"},
+		exceptSetName(nftState.ingressChain, protoIPv6, 1):    {"fd00::-fd00:0:0:2::"},
+		fmt.Sprintf("overlap_%s_%s", protoIPv4, commonSuffix): {"192.168.0.0-192.169.0.0"},
+		fmt.Sprintf("overlap_%s_%s", protoIPv6, commonSuffix): {"fd01::-fd01:0:1::"},
+	} {
+		if got := prefixIntervals(t, c, nftState.filter, name); !slices.Equal(got, want) {
+			t.Errorf("set %s = %v, want %v", name, got, want)
+		}
+	}
+}
+
+// TestIPBlockExceptEdit checks that an edit of an IPBlock except list
+// updates the existing interval set: a replaced, an added, two shifted and a
+// removed prefix. Shifted, each new start equals an old end. A failed update
+// fails the whole batch.
+func TestIPBlockExceptEdit(t *testing.T) {
+	c, newNS := nftest.OpenSystemConn(t, true, DEBUG)
+	defer nftest.CleanupSystemConn(t, newNS, DEBUG)
+	defer c.CloseLasting()
+	c.FlushRuleset()
+	defer c.FlushRuleset()
+
+	nftState, _, _, _, err := prepareEnv(c, false)
+	if err != nil {
+		t.Fatalf("failed to prepare test env: %s", err.Error())
+	}
+
+	for _, step := range []struct {
+		name   string
+		except []string
+		want   []string
+	}{
+		{"initial", []string{"10.0.1.0/24"}, []string{"10.0.1.0-10.0.2.0"}},
+		{"replaced", []string{"10.0.2.0/24"}, []string{"10.0.2.0-10.0.3.0"}},
+		{"added", []string{"10.0.2.0/24", "10.0.4.0/24"}, []string{"10.0.2.0-10.0.3.0", "10.0.4.0-10.0.5.0"}},
+		{"shifted", []string{"10.0.3.0/24", "10.0.5.0/24"}, []string{"10.0.3.0-10.0.4.0", "10.0.5.0-10.0.6.0"}},
+		{"removed", []string{"10.0.5.0/24"}, []string{"10.0.5.0-10.0.6.0"}},
+	} {
+		peer := multiv1beta1.MultiNetworkPolicyPeer{IPBlock: &multiv1beta1.IPBlock{CIDR: "10.0.0.0/16", Except: step.except}}
+		if err := nftState.applyPolicyPeersRulesIPBlock(nftState.ingressChain.Name, nftState.ingressChain, "ns/p", peer, 0); err != nil {
+			t.Fatalf("%s: applyPolicyPeersRulesIPBlock(): %v", step.name, err)
+		}
+		if err := nftState.nft.Flush(); err != nil {
+			t.Fatalf("%s: flush: %v", step.name, err)
+		}
+		if got := prefixIntervals(t, c, nftState.filter, exceptSetName(nftState.ingressChain, protoIPv4, 0)); !slices.Equal(got, step.want) {
+			t.Errorf("%s: except intervals = %v, want %v", step.name, got, step.want)
+		}
 	}
 }
