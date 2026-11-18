@@ -52,10 +52,11 @@ func newRuleData(rule *nftables.Rule) (*ruleData, error) {
 
 	newExprs := []string{}
 	for i := range rule.Exprs {
-		switch rule.Exprs[i].(type) {
+		e := canonicalExpr(rule.Exprs[i])
+		switch e.(type) {
 		case *expr.Meta, *expr.Lookup, *expr.Verdict, *expr.Cmp,
 			*expr.Payload, *expr.Ct, *expr.Bitwise:
-			v, err := hash(rule.Exprs[i])
+			v, err := hash(e)
 			if err != nil {
 				return nil, fmt.Errorf("failed to hash expression: %w", err)
 			}
@@ -65,6 +66,54 @@ func newRuleData(rule *nftables.Rule) (*ruleData, error) {
 
 	data.Exprs = newExprs
 	return data, nil
+}
+
+// canonicalExpr returns e as the kernel dumps it, so that a rule hashes and
+// compares equal to its kernel copy. Otherwise the cleanup after an apply
+// deletes the rule as stale, and the next apply adds it again.
+func canonicalExpr(e expr.Any) expr.Any {
+	switch v := e.(type) {
+	case *expr.Lookup:
+		c := *v
+		// SetID only identifies a set created in the same batch; the
+		// kernel does not return it.
+		c.SetID = 0
+		c.SourceRegister, c.DestRegister = canonicalRegister(c.SourceRegister), canonicalRegister(c.DestRegister)
+		return &c
+	case *expr.Payload:
+		c := *v
+		c.SourceRegister, c.DestRegister = canonicalRegister(c.SourceRegister), canonicalRegister(c.DestRegister)
+		return &c
+	case *expr.Meta:
+		c := *v
+		c.Register = canonicalRegister(c.Register)
+		return &c
+	case *expr.Cmp:
+		c := *v
+		c.Register = canonicalRegister(c.Register)
+		return &c
+	case *expr.Bitwise:
+		c := *v
+		c.SourceRegister, c.DestRegister = canonicalRegister(c.SourceRegister), canonicalRegister(c.DestRegister)
+		return &c
+	case *expr.Ct:
+		c := *v
+		c.Register = canonicalRegister(c.Register)
+		return &c
+	}
+	return e
+}
+
+// canonicalRegister returns the register number the kernel dumps for reg. A
+// 32-bit register that starts a 128-bit one, NFT_REG32_00 (8), _04, _08 or
+// _12, is dumped as that 128-bit register, NFT_REG_1 (1) to NFT_REG_4; see
+// nft_dump_register in net/netfilter/nf_tables_api.c.
+func canonicalRegister(reg uint32) uint32 {
+	const reg32First, reg32Last = 8, 23 // NFT_REG32_00, NFT_REG32_15
+	if reg >= reg32First && reg <= reg32Last && (reg-reg32First)%4 == 0 {
+		return (reg-reg32First)/4 + 1
+	}
+	return reg
 }
 
 func hash(data any) (string, error) {
