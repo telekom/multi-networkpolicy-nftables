@@ -34,6 +34,14 @@ func cleanupAllPods(ctx context.Context, r *NodeReconciler, directClient client.
 	targeted := 0
 	var criClient pb.RuntimeServiceClient
 	var cleanupErrs []error
+	if r.TCBackendEnabled {
+		// tc filters live on the host VF representors, not in a pod netns:
+		// remove every filter this daemon owns, keeping none.
+		if err := r.flushStaleTC(nil); err != nil {
+			debugLog(r.HostPrefix, "cleanup: FAILED to remove tc filters: %v", err)
+			cleanupErrs = append(cleanupErrs, fmt.Errorf("flush tc filters: %w", err))
+		}
+	}
 	for i := range podList.Items {
 		if err := ctx.Err(); err != nil {
 			return fmt.Errorf("cleanup canceled: %w", err)

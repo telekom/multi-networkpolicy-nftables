@@ -42,6 +42,22 @@ type NodeReconciler struct {
 	criMu                    sync.Mutex
 
 	ApplyRulesForPodFunc func(context.Context, controllers.PolicyDeps, controllers.CommonRuleConfig, controllers.PolicyMap, *corev1.Pod, *controllers.PodInfo, string) error
+
+	// TCBackendEnabled opts in to the SR-IOV tc-flower backend
+	// (--enable-tc-backend). The zero value keeps it off: every interface is
+	// enforced by nftables and pkg/tcflower is never called. See tcPass.
+	TCBackendEnabled bool
+	// Test seams for the tc backend; nil uses the real implementation.
+	ApplyTCRulesForPodFunc func(context.Context, controllers.PolicyDeps, controllers.CommonRuleConfig, controllers.PolicyMap, *corev1.Pod, *controllers.PodInfo, string) error
+	TCCheckEnforceableFunc func(hostPrefix string, cfg controllers.CommonRuleConfig, netnsPath string, iface controllers.InterfaceInfo) error
+	FlushRulesForPodFunc   func(podNamespace, podName, netnsPath, hostPrefix string) error
+	FlushStaleTCFunc       func(hostPrefix string, keep []controllers.InterfaceInfo) error
+	// tc backend state, only touched from Reconcile (which runs
+	// single-threaded): the interfaces each pod is enforced on via tc, and
+	// the pods whose netns has been cleared of nftables rules left by an
+	// earlier nftables apply because all their interfaces are on tc.
+	tcEnforced map[types.UID][]controllers.InterfaceInfo
+	nftFlushed map[types.UID]struct{}
 }
 
 // CleanupOnShutdown removes policy rules for pods on the local node.
@@ -85,6 +101,10 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	deps := r.policyDeps()
 	retryNeeded := false
 	var retryErrs []error
+	var tc *tcPass // stays nil unless --enable-tc-backend is set
+	if r.TCBackendEnabled {
+		tc = &tcPass{}
+	}
 	for i := range podList.Items {
 		pod := &podList.Items[i]
 		if !controllers.IsMultiNetworkpolicyTarget(pod) {
@@ -96,6 +116,7 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			klog.Errorf("failed to get pod info for %s/%s: %v", pod.Namespace, pod.Name, err)
 			retryNeeded = true
 			retryErrs = append(retryErrs, fmt.Errorf("get pod info for %s/%s: %w", pod.Namespace, pod.Name, err))
+			tc.podInfoFailed()
 			continue
 		}
 		if podInfo == nil || len(podInfo.Interfaces) == 0 {
@@ -103,10 +124,17 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			continue
 		}
 
-		if err := r.applyRulesForPod(ctx, deps, r.CommonCfg, policyMap, pod, podInfo, r.HostPrefix); err != nil {
+		if err := r.applyPod(ctx, tc, deps, policyMap, pod, podInfo); err != nil {
 			klog.Errorf("failed to apply rules for %s/%s: %v", pod.Namespace, pod.Name, err)
 			retryNeeded = true
 			retryErrs = append(retryErrs, fmt.Errorf("apply rules for %s/%s: %w", pod.Namespace, pod.Name, err))
+		}
+	}
+
+	if tc != nil {
+		if err := r.finishTCPass(tc, podList.Items); err != nil {
+			klog.Errorf("failed to remove stale tc filters: %v", err)
+			retryErrs = append(retryErrs, fmt.Errorf("remove stale tc filters: %w", err))
 		}
 	}
 

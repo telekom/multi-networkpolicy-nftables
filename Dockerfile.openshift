@@ -8,7 +8,7 @@ RUN CGO_ENABLED=0 go build ./cmd/multi-networkpolicy-nftables/
 
 FROM registry.access.redhat.com/ubi8/ubi:latest
 LABEL org.opencontainers.image.source="https://github.com/k8snetworkplumbingwg/multi-networkpolicy-nftables"
-RUN dnf install -y nftables
+RUN dnf install -y nftables iproute
 COPY --from=build /usr/src/multi-networkpolicy-nftables/multi-networkpolicy-nftables /usr/bin
 WORKDIR /usr/bin
 
