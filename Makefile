@@ -14,7 +14,7 @@ TEST_ALL_PKGS ?= ./...
 TEST_UNPRIVILEGED_PKGS ?= ./pkg/controller ./pkg/controllers
 TEST_NFTABLES_PKGS ?= ./pkg/server
 
-.PHONY: all build test lint vet govulncheck fmt fmt-fix clean e2e image manifests verify-manifests help
+.PHONY: all build test test-tc-kernel lint vet govulncheck fmt fmt-fix clean e2e image manifests verify-manifests help
 
 all: build
 
@@ -54,9 +54,9 @@ test-nftables:
 		uid=$$(id -u); gid=$$(id -g); \
 		status=0; \
 		if [ -n "$${KUBEBUILDER_ASSETS:-}" ]; then \
-			sudo env "KUBEBUILDER_ASSETS=$$KUBEBUILDER_ASSETS" "NFTEST_SKIP_IF_UNAVAILABLE=$${NFTEST_SKIP_IF_UNAVAILABLE:-}" go test -v -coverprofile="$(TEST_PROFILE)" $(TEST_NFTABLES_PKGS) || status=$$?; \
+			sudo env "KUBEBUILDER_ASSETS=$$KUBEBUILDER_ASSETS" "NFTEST_SKIP_IF_UNAVAILABLE=$${NFTEST_SKIP_IF_UNAVAILABLE:-}" "TCFLOWER_REQUIRE_KERNEL_TESTS=$${TCFLOWER_REQUIRE_KERNEL_TESTS:-}" go test -v -coverprofile="$(TEST_PROFILE)" $(TEST_NFTABLES_PKGS) || status=$$?; \
 		else \
-			sudo env "NFTEST_SKIP_IF_UNAVAILABLE=$${NFTEST_SKIP_IF_UNAVAILABLE:-}" go test -v -coverprofile="$(TEST_PROFILE)" $(TEST_NFTABLES_PKGS) || status=$$?; \
+			sudo env "NFTEST_SKIP_IF_UNAVAILABLE=$${NFTEST_SKIP_IF_UNAVAILABLE:-}" "TCFLOWER_REQUIRE_KERNEL_TESTS=$${TCFLOWER_REQUIRE_KERNEL_TESTS:-}" go test -v -coverprofile="$(TEST_PROFILE)" $(TEST_NFTABLES_PKGS) || status=$$?; \
 		fi; \
 		if [ -f "$(TEST_PROFILE)" ]; then sudo chown "$$uid:$$gid" "$(TEST_PROFILE)"; fi; \
 		exit $$status; \
@@ -64,6 +64,17 @@ test-nftables:
 		echo "make $(if $(MAKECMDGOALS),$(firstword $(MAKECMDGOALS)),$@) requires root or passwordless sudo; refusing to prompt interactively"; \
 		exit 1; \
 	fi
+
+## test-tc-kernel: Run the tc flower backend's kernel tests: real packets over a veth pair and a simulated switchdev NIC (requires Linux, root/passwordless sudo, and the netdevsim and act_ct modules)
+test-tc-kernel:
+	@set -e; \
+	if [ "$(HOST_OS)" != "linux" ]; then echo "make $@ requires Linux"; exit 1; fi; \
+	asroot=""; if [ "$$(id -u)" -ne 0 ]; then asroot="sudo -n"; fi; \
+	$$asroot modprobe netdevsim; \
+	$$asroot modprobe act_ct; \
+	$$asroot env "PATH=$$PATH" "GOCACHE=$$(go env GOCACHE)" "GOMODCACHE=$$(go env GOMODCACHE)" \
+		TCFLOWER_REQUIRE_KERNEL_TESTS=1 TCFLOWER_NETDEVSIM=1 "TCFLOWER_NETDEVSIM_KEEP=$${TCFLOWER_NETDEVSIM_KEEP:-}" \
+		go test -v -count=1 -timeout 3m -run 'E2E|Netdevsim' ./pkg/tcflower/
 
 ## lint: Run golangci-lint
 lint:

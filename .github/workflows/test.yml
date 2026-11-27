@@ -12,6 +12,8 @@ jobs:
   test:
     env:
       NFTEST_SKIP_IF_UNAVAILABLE: "1"
+      # The tc flower kernel tests must run here, not skip.
+      TCFLOWER_REQUIRE_KERNEL_TESTS: "1"
     strategy:
       matrix:
         go-version: ["1.25.13"]
@@ -60,7 +62,10 @@ jobs:
         echo "KUBEBUILDER_ASSETS=$(setup-envtest use 1.35.0 --bin-dir testbin/k8s -p path)" >> "$GITHUB_ENV"
 
     - name: Load kernel modules
-      run: sudo modprobe nft_ct
+      # act_ct is for the tc flower backend's conntrack test in pkg/tcflower.
+      run: |
+        sudo modprobe nft_ct
+        sudo modprobe act_ct
 
     - name: Test unprivileged packages
       run: make test-unprivileged
@@ -75,6 +80,28 @@ jobs:
         path-to-profile: profile.cov
         flag-name: "Go-${{ matrix.go-version }}-${{ matrix.os }}"
         parallel: true
+
+    # The tc flower backend against a simulated switchdev NIC (netdevsim with
+    # VF representors), plus its veth tests again with streamed output. This
+    # is a step of its own, after the coverage run and with a time limit,
+    # because it creates and removes kernel devices.
+    - name: Test the tc flower backend on a simulated switchdev NIC
+      timeout-minutes: 5
+      run: |
+        uname -r
+        # netdevsim lives in the modules-extra package on some runner images.
+        sudo modprobe netdevsim || {
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq "linux-modules-extra-$(uname -r)"
+        }
+        # The runner is thrown away afterwards, so the simulated NIC is left
+        # in place: removing a netdevsim device in switchdev mode did not
+        # return on the 7.0 azure kernel.
+        TCFLOWER_NETDEVSIM_KEEP=1 make test-tc-kernel
+
+    - name: Kernel log of the simulated NIC test
+      if: failure() || cancelled()
+      run: sudo dmesg | tail -n 120
 
   # notifies that all test jobs are finished.
   finish:
