@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"strings"
 	"time"
 
@@ -62,7 +63,7 @@ type InterfaceInfo struct {
 	NetattachName string
 	InterfaceName string
 	InterfaceType string
-	IPs           []string
+	IPs           []netip.Addr
 }
 
 // CheckPolicyNetwork checks whether given interface is target or not,

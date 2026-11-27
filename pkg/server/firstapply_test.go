@@ -18,6 +18,7 @@ package server
 
 import (
 	"context"
+	"net/netip"
 	"reflect"
 	"testing"
 
@@ -64,7 +65,7 @@ func TestApplyPolicyRulesFirstApplyKeepsSetLookups(t *testing.T) {
 			NetattachName: "testns1/policy-net-1",
 			InterfaceName: "net1",
 			InterfaceType: "macvlan",
-			IPs:           []string{"10.1.1.1"},
+			IPs:           []netip.Addr{netip.MustParseAddr("10.1.1.1")},
 		}},
 	}
 	if err := ApplyPolicyRulesForPodAndFamily(context.Background(), newTestPolicyDeps(), controllers.CommonRuleConfig{}, controllers.PolicyMap{}, pod, podInfo, c); err != nil {
