@@ -19,6 +19,7 @@ package controllers
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/netip"
 	"strings"
 	"time"
@@ -64,6 +65,24 @@ type InterfaceInfo struct {
 	InterfaceName string
 	InterfaceType string
 	IPs           []netip.Addr
+
+	// SR-IOV device information, populated from the Multus network-status
+	// annotation's device-info.pci field when the interface is backed by an
+	// SR-IOV virtual function. When set, the interface is enforced on the host
+	// via tc flower on its VF representor if the tc backend can enforce it, and
+	// otherwise by nftables inside the pod network namespace (see the
+	// reconciler's selectBackend). Empty for veth-style CNIs (macvlan, ipvlan,
+	// bond).
+	PCIAddress        string
+	PFPCIAddress      string
+	RepresentorDevice string
+}
+
+// IsSRIOV reports whether the interface is backed by an SR-IOV virtual function
+// and is therefore a candidate for tc flower enforcement on its host VF
+// representor.
+func (info *InterfaceInfo) IsSRIOV() bool {
+	return info.PCIAddress != "" || info.RepresentorDevice != ""
 }
 
 // CheckPolicyNetwork checks whether given interface is target or not,
@@ -85,6 +104,25 @@ type PodInfo struct {
 	NetworkStatus []netdefv1.NetworkStatus
 	NodeName      string
 	Interfaces    []InterfaceInfo
+	// ContainerPorts are the ports of the pod's containers. Named ports in
+	// policies resolve against them.
+	ContainerPorts []v1.ContainerPort
+}
+
+// ResolveNamedPort returns the number of the container port with the given
+// name and protocol. Named ports resolve like in Kubernetes NetworkPolicy:
+// against the container ports of the pod that receives the traffic.
+func ResolveNamedPort(ports []v1.ContainerPort, name string, proto v1.Protocol) (uint16, bool) {
+	for _, p := range ports {
+		cproto := p.Protocol
+		if cproto == "" {
+			cproto = v1.ProtocolTCP
+		}
+		if p.Name == name && cproto == proto && p.ContainerPort >= 1 && p.ContainerPort <= math.MaxUint16 {
+			return uint16(p.ContainerPort), true //nolint:gosec // G115: checked in range [1, 65535] above
+		}
+	}
+	return 0, false
 }
 
 // CheckPolicyNetwork checks whether given pod is target or not,
