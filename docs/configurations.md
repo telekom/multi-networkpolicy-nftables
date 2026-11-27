@@ -55,3 +55,12 @@ Some networks may require accepting traffic from/to specific address prefixes fo
 --allow-src-prefix=fe80::/10
 --allow-dst-prefix=fe80::/10,ff00::/8
 ```
+
+#### SR-IOV tc-flower backend (experimental, opt-in)
+
+`--enable-tc-backend` enforces SR-IOV VFs in switchdev mode with tc flower on
+the host VF representor, offloaded to the NIC eSwitch, instead of nftables in
+the pod netns. It is off by default; without the flag nothing changes. See
+[SR-IOV tc-flower backend](sriov-tc-backend.md) for prerequisites, the
+`--tc-offload-mode`, `--tc-ct-mode` and `--tc-default-deny` flags, and
+limitations.

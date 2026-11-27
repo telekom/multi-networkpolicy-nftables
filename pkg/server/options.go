@@ -54,6 +54,12 @@ type Options struct {
 	// healthBindAddress is the IP address the health HTTP server binds to.
 	// Defaults to "" (all interfaces); set to "127.0.0.1" to restrict to loopback.
 	healthBindAddress string
+	tcOffloadMode     string
+	tcCTMode          string
+	enableTCBackend   bool
+	// tcDefaultDeny is the --tc-default-deny mode: none, ingress, egress or all.
+	tcDefaultDeny    string
+	tcCleanupOnStart bool
 
 	// updated by command line parsing
 	allowSrcPrefix []string
@@ -69,6 +75,8 @@ type ReconcilerConfig struct {
 	ContainerRuntimeEndpoint string
 	NetworkPlugins           []string
 	SyncPeriodSeconds        int
+	EnableTCBackend          bool
+	TCCleanupOnStart         bool
 	CommonRuleConfig         controllers.CommonRuleConfig
 }
 
@@ -94,6 +102,11 @@ func (o *Options) AddFlags(fs *pflag.FlagSet) {
 	fs.StringVar(&o.allowDstPrefixText, "allow-dst-prefix", "", "Accept destination IP prefix list, comma separated CIDRs (e.g. \"fe80::/10,ff00::/8\")")
 	fs.IntVar(&o.healthPort, "health-port", 0, "TCP port for the health HTTP server (0 to disable, 1-65535 to enable).")
 	fs.StringVar(&o.healthBindAddress, "health-bind-address", "", "IP address the health HTTP server binds to (empty = all interfaces, 127.0.0.1 = loopback only).")
+	fs.BoolVar(&o.enableTCBackend, "enable-tc-backend", false, "Experimental, opt-in: enforce SR-IOV VFs in switchdev mode with tc flower filters on the host VF representor (offloaded to the NIC eSwitch) instead of nftables in the pod netns. A VF that tc cannot enforce (legacy eSwitch, no representor, or --tc-ct-mode=require without SMFS) stays on nftables. When false (default) the tc backend is never used and --tc-offload-mode / --tc-ct-mode are ignored. See docs/sriov-tc-backend.md.")
+	fs.StringVar(&o.tcOffloadMode, "tc-offload-mode", "hardware", "With --enable-tc-backend: 'hardware' (skip_sw: hardware-only, a filter the NIC cannot offload is rejected) or 'software' (skip_hw: kernel datapath, for testing without offload-capable hardware).")
+	fs.StringVar(&o.tcCTMode, "tc-ct-mode", "require", "With --enable-tc-backend: conntrack policy on the eSwitch. 'require': use tc only where hardware CT offload is confirmed (SMFS steering, read via devlink); other VFs stay on the stateful nftables backend. 'auto': use CT where SMFS is confirmed, otherwise STATELESS tc (reply traffic is not tracked). 'off': always stateless tc.")
+	fs.StringVar(&o.tcDefaultDeny, "tc-default-deny", "none", "With --enable-tc-backend: deny traffic on SR-IOV VFs enforced by the tc backend that no MultiNetworkPolicy selects. Possible values: 'none', 'ingress', 'egress', 'all'. Independent of the interfaces the nftables backend enforces.")
+	fs.BoolVar(&o.tcCleanupOnStart, "tc-cleanup-on-start", false, "Without --enable-tc-backend: once at start-up, remove the tc flower filters that an earlier run with the tc backend left on VF representors (for example after it was killed). This is the only tc access of a daemon that does not enable the backend.")
 	fs.AddGoFlagSet(flag.CommandLine)
 }
 
@@ -141,7 +154,32 @@ func (o *Options) Validate() error {
 	if !filepath.IsAbs(o.containerRuntimeEndpoint) {
 		return fmt.Errorf("container-runtime-endpoint must be an absolute filesystem path")
 	}
+	tcDenyIngress, tcDenyEgress, err := parseDefaultDeny("tc-default-deny", o.tcDefaultDeny)
+	if err != nil {
+		return err
+	}
+	if (tcDenyIngress || tcDenyEgress) && !o.enableTCBackend {
+		return fmt.Errorf("tc-default-deny %q needs --enable-tc-backend: it only covers interfaces the tc backend enforces", o.tcDefaultDeny)
+	}
 	return nil
+}
+
+// parseDefaultDeny parses the value of a default-deny flag into the directions
+// that are denied for interfaces no policy selects. An empty value, as in an
+// Options literal, means none. Every backend's default-deny flag uses it, so
+// they accept the same values and fail the same way.
+func parseDefaultDeny(flagName, value string) (ingress, egress bool, err error) {
+	switch value {
+	case "", "none":
+		return false, false, nil
+	case "ingress":
+		return true, false, nil
+	case "egress":
+		return false, true, nil
+	case "all":
+		return true, true, nil
+	}
+	return false, false, fmt.Errorf("%s %q is invalid, must be one of none, ingress, egress or all", flagName, value)
 }
 
 // BuildReconcilerConfig resolves all configuration needed to build a NodeReconciler.
@@ -164,11 +202,18 @@ func (o *Options) BuildReconcilerConfig() (*ReconcilerConfig, error) {
 		ContainerRuntimeEndpoint: o.containerRuntimeEndpoint,
 		NetworkPlugins:           o.networkPlugins,
 		SyncPeriodSeconds:        o.syncPeriod,
+		EnableTCBackend:          o.enableTCBackend,
+		TCCleanupOnStart:         o.tcCleanupOnStart,
 		CommonRuleConfig: controllers.CommonRuleConfig{
 			AcceptICMP:     o.acceptICMP,
 			AcceptICMPv6:   o.acceptICMPv6,
 			AllowSrcPrefix: o.allowSrcPrefix,
 			AllowDstPrefix: o.allowDstPrefix,
+			TCOffloadMode:  o.tcOffloadMode,
+			CTMode:         o.tcCTMode,
+			// Validate has accepted the value.
+			TCDefaultDenyIngress: o.tcDefaultDeny == "ingress" || o.tcDefaultDeny == "all",
+			TCDefaultDenyEgress:  o.tcDefaultDeny == "egress" || o.tcDefaultDeny == "all",
 		},
 	}, nil
 }
