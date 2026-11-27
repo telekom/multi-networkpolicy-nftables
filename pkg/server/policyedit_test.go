@@ -19,6 +19,7 @@ package server
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"slices"
 	"testing"
 
@@ -44,7 +45,7 @@ func TestApplyPolicyRulesPolicyEdit(t *testing.T) {
 	c.FlushRuleset()
 	pod := NewFakePodWithNetAnnotation("testns1", "testpod1", "policy-net-1", "", nil)
 	podInfo := &controllers.PodInfo{Name: pod.Name, Namespace: pod.Namespace, Interfaces: []controllers.InterfaceInfo{{
-		NetattachName: "testns1/policy-net-1", InterfaceName: "net1", InterfaceType: "macvlan", IPs: []string{"10.1.1.1"}}}}
+		NetattachName: "testns1/policy-net-1", InterfaceName: "net1", InterfaceType: "macvlan", IPs: []netip.Addr{netip.MustParseAddr("10.1.1.1")}}}}
 	for i, step := range []struct {
 		port   int32
 		cidr   string

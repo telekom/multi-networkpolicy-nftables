@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -479,7 +480,7 @@ func testInterface() controllers.InterfaceInfo {
 	return controllers.InterfaceInfo{
 		NetattachName: "net1",
 		InterfaceName: "net1",
-		IPs:           []string{"10.0.0.1"},
+		IPs:           []netip.Addr{netip.MustParseAddr("10.0.0.1")},
 	}
 }
 
