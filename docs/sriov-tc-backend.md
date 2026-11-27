@@ -236,6 +236,17 @@ modules):
 | `TestSoftwareConntrackE2E` | The conntrack pipeline with `act_ct`: with ingress denied by default, replies to an allowed outgoing connection pass; without conntrack they are dropped. | CT offload (SMFS). |
 | `TestNetdevsimSwitchdev` | A simulated switchdev NIC (netdevsim, 2 VFs): representor discovery from real `phys_switch_id` / `phys_port_name`, the netlink driver on real representor netdevs, direction mapping (which hook the filters land on), generation switch, default deny coming and going, a refused `skip_sw` insert leaving nothing half-installed, `FlushStale`. | netdevsim is not a PCI device (the `physfn`/`virtfn` links are a fixture), has no VF netdevs and passes no traffic through representors, and does not offload flower. |
 
+A further tier runs on demand and for changes to the backend (`make
+test-sriov-switchdev-vm`; Linux with KVM and QEMU 8.1 or newer). It boots a
+VM with QEMU's emulated `igb` SR-IOV NIC and turns it into a switchdev NIC
+with the out-of-tree
+[switchdev-mock-driver](https://github.com/SchSeba/switchdev-mock-driver),
+which is built and loaded only inside the VM:
+
+| Test | Covers | Does not cover |
+|------|--------|----------------|
+| `TestVirtualSwitchdev` | Real PCI VFs and real VF representors: discovery over the real `physfn` / `virtfn` links, the VF-to-pod check with a VF netdev in a netns, and allow/deny with real packets from one VF to another through the representors, across a policy change, default deny and conntrack. Software datapath (`skip_hw`). | Offload: the mock driver's own engine only takes IPv4 redirect/drop rules on a representor's ingress hook in chain 0, so it refuses the backend's `skip_sw` filters (accept, `goto chain`, the egress hook, IPv6). |
+
 Still open, and only checkable on a ConnectX-5 or newer in switchdev mode:
 
 1. Start the daemon with `--enable-tc-backend` and check the `tcflower

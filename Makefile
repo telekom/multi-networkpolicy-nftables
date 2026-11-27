@@ -14,7 +14,7 @@ TEST_ALL_PKGS ?= ./...
 TEST_UNPRIVILEGED_PKGS ?= ./pkg/controller ./pkg/controllers
 TEST_NFTABLES_PKGS ?= ./pkg/server
 
-.PHONY: all build test test-tc-kernel lint vet govulncheck fmt fmt-fix clean e2e image manifests verify-manifests help
+.PHONY: all build test test-tc-kernel test-sriov-switchdev-vm lint vet govulncheck fmt fmt-fix clean e2e image manifests verify-manifests help
 
 all: build
 
@@ -75,6 +75,10 @@ test-tc-kernel:
 	$$asroot env "PATH=$$PATH" "GOCACHE=$$(go env GOCACHE)" "GOMODCACHE=$$(go env GOMODCACHE)" \
 		TCFLOWER_REQUIRE_KERNEL_TESTS=1 TCFLOWER_NETDEVSIM=1 "TCFLOWER_NETDEVSIM_KEEP=$${TCFLOWER_NETDEVSIM_KEEP:-}" \
 		go test -v -count=1 -timeout 3m -run 'E2E|Netdevsim' ./pkg/tcflower/
+
+## test-sriov-switchdev-vm: Run the tc flower backend against real VFs and representors in a KVM guest (emulated igb NIC + switchdev-mock-driver; requires Linux, /dev/kvm, QEMU >= 8.1, cloud-image-utils)
+test-sriov-switchdev-vm:
+	hack/sriov-switchdev-vm/run.sh
 
 ## lint: Run golangci-lint
 lint:

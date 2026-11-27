@@ -1,0 +1,42 @@
+# Virtual SR-IOV switchdev tier for the tc flower backend: a KVM guest with an
+# emulated igb NIC and the out-of-tree switchdev-mock-driver. See
+# hack/sriov-switchdev-vm/run.sh. It builds third-party kernel code inside the
+# guest, so it only runs on demand and for changes to the backend itself.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - pkg/tcflower/**
+      - hack/sriov-switchdev-vm/**
+      - .github/workflows/sriov-switchdev-vm.yml
+name: sriov-switchdev-vm
+permissions:
+  contents: read
+jobs:
+  switchdev-vm:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        persist-credentials: false
+
+    - name: Install Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: "1.25.13"
+        cache: true
+
+    - name: Enable KVM and install QEMU
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq qemu-system-x86 qemu-utils cloud-image-utils
+        uname -r
+
+    - name: Run the virtual switchdev tier
+      timeout-minutes: 30
+      run: make test-sriov-switchdev-vm
