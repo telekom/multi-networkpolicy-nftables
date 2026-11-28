@@ -18,6 +18,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"slices"
 	"strings"
@@ -84,6 +85,9 @@ func (s *Server) MarkShuttingDown() {
 type internalPolicy struct {
 	policy         *multiv1beta1.MultiNetworkPolicy
 	policyNetworks []string
+	// invalid marks a policy whose rules cannot be built. It still selects
+	// the pod, so the pod gets the drop, but none of its rules.
+	invalid bool
 }
 
 // CompareInternalPolicy orders internal policies by namespace and name.
@@ -105,6 +109,7 @@ func ApplyPolicyRulesForPodAndFamily(ctx context.Context, deps controllers.Polic
 
 	var ingressPolicies []internalPolicy
 	var egressPolicies []internalPolicy
+	var invalidErrs []error
 
 	for _, policy := range policyMap {
 		if policy.GetNamespace() != pod.Namespace {
@@ -138,11 +143,18 @@ func ApplyPolicyRulesForPodAndFamily(ctx context.Context, deps controllers.Polic
 		slices.Sort(policyNetworks)
 
 		if podInfo.CheckPolicyNetwork(policyNetworks) {
+			ip := internalPolicy{policy: policy, policyNetworks: policyNetworks}
+			// Fail closed: an invalid policy would fail the whole batch and
+			// leave the pod without any rules, not even the drop.
+			if err := validatePolicy(policy); err != nil {
+				invalidErrs = append(invalidErrs, fmt.Errorf("invalid policy %q selects the pod but allows nothing: %w", policyNamespacedName(policy), err))
+				ip.invalid = true
+			}
 			if ingressEnable {
-				ingressPolicies = append(ingressPolicies, internalPolicy{policy: policy, policyNetworks: policyNetworks})
+				ingressPolicies = append(ingressPolicies, ip)
 			}
 			if egressEnable {
-				egressPolicies = append(egressPolicies, internalPolicy{policy: policy, policyNetworks: policyNetworks})
+				egressPolicies = append(egressPolicies, ip)
 			}
 		}
 	}
@@ -155,42 +167,11 @@ func ApplyPolicyRulesForPodAndFamily(ctx context.Context, deps controllers.Polic
 	slices.SortStableFunc(ingressPolicies, CompareInternalPolicy)
 	slices.SortStableFunc(egressPolicies, CompareInternalPolicy)
 
-	if len(ingressPolicies) > 0 {
-		forceUpdate := false
-		for _, policy := range ingressPolicies {
-			newRules, err := nftState.applyPodRules(ctx, deps, cfg, nftState.ingressChain, podInfo, policy.policy, policy.policyNetworks)
-			if err != nil {
-				return fmt.Errorf("failed to apply pod ingress rules for policy %q: %w", policyNamespacedName(policy.policy), err)
-			}
-			if newRules {
-				forceUpdate = true
-			}
-			if err := nftState.applyGeneralMarkCheck(nftState.ingressChain, policy.policy); err != nil {
-				return fmt.Errorf("failed to apply mark check rule in chain %q: %w", nftState.ingressChain.Name, err)
-			}
-		}
-		if err := nftState.applyDropRemaining(nftState.ingressChain, forceUpdate); err != nil {
-			return fmt.Errorf("failed to apply drop-remaining ingress rules: %w", err)
-		}
+	if err := nftState.applyDirectionRules(ctx, deps, cfg, nftState.ingressChain, "ingress", podInfo, ingressPolicies, cfg.DefaultDenyIngress); err != nil {
+		return err
 	}
-
-	if len(egressPolicies) > 0 {
-		forceUpdate := false
-		for _, policy := range egressPolicies {
-			newRules, err := nftState.applyPodRules(ctx, deps, cfg, nftState.egressChain, podInfo, policy.policy, policy.policyNetworks)
-			if err != nil {
-				return fmt.Errorf("failed to apply pod egress rules for policy %q: %w", policyNamespacedName(policy.policy), err)
-			}
-			if newRules {
-				forceUpdate = true
-			}
-			if err := nftState.applyGeneralMarkCheck(nftState.egressChain, policy.policy); err != nil {
-				return fmt.Errorf("failed to apply mark check rule in chain %q: %w", nftState.egressChain.Name, err)
-			}
-		}
-		if err := nftState.applyDropRemaining(nftState.egressChain, forceUpdate); err != nil {
-			return fmt.Errorf("failed to apply drop-remaining egress rules: %w", err)
-		}
+	if err := nftState.applyDirectionRules(ctx, deps, cfg, nftState.egressChain, "egress", podInfo, egressPolicies, cfg.DefaultDenyEgress); err != nil {
+		return err
 	}
 	if err := nftState.nft.Flush(); err != nil {
 		return fmt.Errorf("nft flush failed for pod [%s]: %w", podNamespacedName(pod), err)
@@ -200,6 +181,37 @@ func ApplyPolicyRulesForPodAndFamily(ctx context.Context, deps controllers.Polic
 		return fmt.Errorf("failed to cleanup nft: %w", err)
 	}
 
+	return errors.Join(invalidErrs...)
+}
+
+// applyDirectionRules adds the rules of the policies of one direction to its
+// chain, followed by the drop of everything they do not allow. Without
+// policies, the chain gets the drop only with default deny: an unselected pod
+// is then treated like one selected by a policy that allows nothing.
+func (n *nftState) applyDirectionRules(ctx context.Context, deps controllers.PolicyDeps, cfg controllers.CommonRuleConfig, chain *nftables.Chain, direction string, podInfo *controllers.PodInfo, policies []internalPolicy, defaultDeny bool) error {
+	if len(policies) == 0 && !defaultDeny {
+		return nil
+	}
+	forceUpdate := false
+	for _, policy := range policies {
+		if policy.invalid {
+			continue
+		}
+		newRules, err := n.applyPodRules(ctx, deps, cfg, chain, podInfo, policy.policy, policy.policyNetworks)
+		if err != nil {
+			return fmt.Errorf("failed to apply pod %s rules for policy %q: %w", direction, policyNamespacedName(policy.policy), err)
+		}
+		if newRules {
+			forceUpdate = true
+		}
+		if err := n.applyGeneralMarkCheck(chain, policy.policy); err != nil {
+			return fmt.Errorf("failed to apply mark check rule in chain %q: %w", chain.Name, err)
+		}
+	}
+	// A new rule was appended after the existing drop; re-append the drop.
+	if err := n.applyDropRemaining(chain, forceUpdate); err != nil {
+		return fmt.Errorf("failed to apply drop-remaining %s rules: %w", direction, err)
+	}
 	return nil
 }
 
