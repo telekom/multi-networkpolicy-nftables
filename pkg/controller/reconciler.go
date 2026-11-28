@@ -102,6 +102,9 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 		if podInfo == nil || len(podInfo.Interfaces) == 0 {
 			klog.V(4).Infof("pod %s/%s has no relevant interfaces, skipping", pod.Namespace, pod.Name)
+			if podNeedsInterfaceRetry(pod, podInfo) {
+				retryNeeded = true
+			}
 			continue
 		}
 
@@ -119,6 +122,17 @@ func (r *NodeReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 	return ctrl.Result{}, nil
+}
+
+// podNeedsInterfaceRetry reports whether the pod selects secondary networks
+// whose network-status has not been published yet. Once a secondary status is
+// reported, a pod without usable interfaces is attached only to networks this
+// controller does not handle, and requeueing it would loop forever.
+func podNeedsInterfaceRetry(pod *corev1.Pod, podInfo *controllers.PodInfo) bool {
+	if podInfo != nil && controllers.HasPublishedSecondaryNetworkStatus(podInfo.NetworkStatus) {
+		return false
+	}
+	return controllers.RequestsSecondaryNetworks(pod)
 }
 
 func (r *NodeReconciler) policyDeps() controllers.PolicyDeps {
